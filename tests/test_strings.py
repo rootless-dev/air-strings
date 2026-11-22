@@ -149,3 +149,15 @@ def test_end_resize_restarts_the_grace_period():
     strings.end_resize(string, 5.0)
     assert not string.can_pluck(5.0 + COMMIT_GRACE_S / 2)
     assert string.can_pluck(5.0 + COMMIT_GRACE_S * 1.1)
+
+
+def test_a_string_being_resized_skips_the_commit_grace_but_not_the_cooldown():
+    strings = make_set()
+    string = strings.add((100.0, 200.0), (700.0, 200.0), DIAGONAL, now=0.0)
+    assert not string.can_pluck(COMMIT_GRACE_S / 2)
+    strings.begin_resize(string)
+    assert string.can_pluck(COMMIT_GRACE_S / 2)
+    string.pluck(COMMIT_GRACE_S / 2, 0.5, 1.0)
+    assert not string.can_pluck(COMMIT_GRACE_S / 2 + PLUCK_COOLDOWN_S / 2)
+    strings.end_resize(string, 1.0)
+    assert not string.can_pluck(1.0 + COMMIT_GRACE_S / 2)

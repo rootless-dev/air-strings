@@ -10,7 +10,7 @@ from air_strings.gestures import PULL_THRESHOLD_VELOCITY, DrawGesture, GestureCo
 from air_strings.hands import INDEX_TIP, THUMB_TIP, Hand
 from air_strings.particles import ParticleSystem
 from air_strings.render import Renderer
-from air_strings.scales import SCALES, PitchMapping
+from air_strings.scales import SCALES, PitchMapping, midi_to_frequency
 from air_strings.strings import StringSet
 
 DIAGONAL = math.hypot(1280, 720)
@@ -137,4 +137,37 @@ def test_grab_resize_then_pull_and_release(monkeypatch):
     assert frequency == string.frequency
     assert velocity == pytest.approx(PULL_THRESHOLD_VELOCITY * 55.0 / 50.0)
     assert position == pytest.approx(200.0 / 500.0)
+    assert particles.count > 0
+
+
+def test_other_hand_plucks_while_resizing_at_the_current_note(monkeypatch):
+    script = draw_string_script((300.0, 360.0), (1000.0, 360.0))  # 700 px
+    script += [[(0, (600.0, 200.0), False)] for _ in range(10)]  # frames 10-19: commit, rest
+    # Frames 20-29: hand 0 pinches the right end and drags it to x = 800 (500 px); hand 1 rests above.
+    script += [[(0, (float(x), 360.0), True), (1, (500.0, 300.0), False)] for x in np.linspace(1000.0, 800.0, 10)]
+    script += [[(0, (800.0, 360.0), True), (1, (500.0, 460.0), False)]]  # frame 30: hand 1 swipes down
+    # Frames 31-35: hand 0 drags on to x = 650 (350 px); frames 36-39: holds there.
+    script += [[(0, (float(x), 360.0), True), (1, (500.0, 460.0), False)] for x in np.linspace(770.0, 650.0, 5)]
+    script += [[(0, (650.0, 360.0), True), (1, (500.0, 460.0), False)] for _ in range(4)]
+    script += [[(0, (650.0, 360.0), True), (1, (500.0, 260.0), False)]]  # frame 40: hand 1 swipes back up
+    script += [[(1, (500.0, 260.0), False)]]  # frames 41+: hand 0 lets go
+    app, strings, audio, particles, renderer = make_app(monkeypatch, script, frames=46)
+
+    assert app.run() == 0
+    [string] = strings.strings
+    assert string.start == (300.0, 360.0)
+    assert string.end == pytest.approx((650.0, 360.0))
+
+    first_note = strings.note_for_length(500.0, DIAGONAL)
+    second_note = strings.note_for_length(350.0, DIAGONAL)
+    assert first_note != second_note
+    assert [(p[0], p[1]) for p in audio.plucks] == [
+        (string.string_id, midi_to_frequency(first_note)),
+        (string.string_id, midi_to_frequency(second_note)),
+    ]
+    assert [p[3] for p in audio.plucks] == pytest.approx([200.0 / 500.0, 200.0 / 350.0])
+    # Both plucks happened mid-resize, with the ruler showing the note that was played.
+    assert renderer.views[30].stretches[0].midi == first_note
+    assert renderer.views[40].stretches[0].midi == second_note
+    assert all(not v.stretches for v in renderer.views[43:])
     assert particles.count > 0

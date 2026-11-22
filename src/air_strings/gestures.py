@@ -2,7 +2,8 @@
 
 - Draw: two pinching hands stretch a pending string; releasing a pinch commits it.
 - Grab: one hand pinching next to an endpoint of a string drags that endpoint
-  (the string is re-tuned live); releasing the pinch leaves it there.
+  (the string is re-tuned live, and the other hand can keep plucking it);
+  releasing the pinch leaves it there.
 - Pull: an open hand's index fingertip pushing through a string catches it; the
   string bends through the fingertip and is plucked when it slips off.
 
@@ -215,6 +216,7 @@ class GrabGesture:
                 grab = self._start(hand, strings, radius)
                 if grab is not None:
                     claimed.add(hand.hand_id)
+                    strings.begin_resize(grab.string)
                     self._grabs.append(grab)
         self._was_pinching = set(pinching)
         return {grab.hand_id for grab in self._grabs}
@@ -282,8 +284,10 @@ class PullGesture:
     - when the fingertip backs out across the rest line: silently (the string
       just returns to rest), and that move does not catch it again.
 
-    A string is held by one fingertip at a time. Strings in cooldown, in their
-    post-commit grace period or being resized cannot be caught.
+    A string is held by one fingertip at a time. Strings in cooldown or in their
+    post-commit grace period cannot be caught. A string being resized plays like
+    any other, at the note it has at that moment: its geometry, and so the bend,
+    the deflection and the threshold, are read live every frame.
     """
 
     def __init__(
@@ -310,12 +314,10 @@ class PullGesture:
         now: float,
         dt: float,
         frame_diagonal: float,
-        blocked: set[int],
     ) -> list[Pluck]:
         """Advance the holds and catch new strings; returns the plucks released this frame.
 
-        `hands` are the hands free to pluck; `blocked` holds the ids of strings
-        that must not be caught (being resized).
+        `hands` are the hands free to pluck (not grabbing an endpoint).
         """
         by_id = {h.hand_id: h for h in hands}
         plucks: list[Pluck] = []
@@ -323,8 +325,8 @@ class PullGesture:
         kept: list[_Hold] = []
         for hold in self._holds:
             string = hold.string
-            if string not in strings or string.string_id in blocked:
-                continue  # removed or grabbed: let go without a sound
+            if string not in strings:
+                continue  # removed: let go without a sound
             hand = by_id.get(hold.hand_id)
             if hand is None or hand.pinching:
                 self._soft_release(hold, now, frame_diagonal, plucks)
@@ -352,7 +354,7 @@ class PullGesture:
                 continue
             for crossing in strings.find_crossings(hand.previous_tip, hand.tip, now):
                 string = crossing.string
-                if string.string_id in held or string.string_id in blocked:
+                if string.string_id in held:
                     continue
                 if (hand.hand_id, string.string_id) in done:
                     continue
@@ -407,8 +409,9 @@ class PullGesture:
 class GestureController:
     """Runs grab, draw and pull each frame, in that priority order, on one `StringSet`.
 
-    A hand that is grabbing an endpoint neither counts as a drawing hand nor plucks.
-    New grabs are not started while a two-hand string is being drawn.
+    A hand that is grabbing an endpoint neither counts as a drawing hand nor plucks,
+    but the other hand can pluck the string being resized. New grabs are not
+    started while a two-hand string is being drawn.
     """
 
     def __init__(self, strings: StringSet, draw: DrawGesture, grab: GrabGesture, pull: PullGesture) -> None:
@@ -426,7 +429,7 @@ class GestureController:
         if committed is not None:
             self._strings.add(committed[0], committed[1], frame_diagonal, now)
         free_hands = [h for h in hands if h.hand_id not in grabbing]
-        return self._pull.update(free_hands, self._strings, now, dt, frame_diagonal, self._grab.grabbed_ids())
+        return self._pull.update(free_hands, self._strings, now, dt, frame_diagonal)
 
     def view(self) -> GestureView:
         stretches = list(self._grab.stretches())

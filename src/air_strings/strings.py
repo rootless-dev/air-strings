@@ -57,6 +57,7 @@ class AirString:
     midi: int
     color: tuple[int, int, int]
     created_at: float  # commit time; also reset when a resize ends
+    resizing: bool = False  # an endpoint is being dragged; the post-commit grace does not apply
     last_pluck_at: float = -math.inf
     pluck_position: float = 0.5
     pluck_amplitude: float = 0.0  # signed: initial displacement, in pixels along the normal
@@ -75,7 +76,8 @@ class AirString:
         return note_name(self.midi)
 
     def can_pluck(self, now: float) -> bool:
-        return now - self.created_at >= COMMIT_GRACE_S and now - self.last_pluck_at >= PLUCK_COOLDOWN_S
+        graced = self.resizing or now - self.created_at >= COMMIT_GRACE_S
+        return graced and now - self.last_pluck_at >= PLUCK_COOLDOWN_S
 
     def pluck(self, now: float, position: float, velocity: float, displacement: float | None = None) -> None:
         """Start the visual vibration from a triangular shape peaked at `position` (0..1).
@@ -205,8 +207,13 @@ class StringSet:
         string.pitch = self._mapping.continuous_midi(string.length / frame_diagonal)
         string.midi = self._mapping.quantize(string.pitch, self._scale)
 
+    def begin_resize(self, string: AirString) -> None:
+        """A resize has started: the string can be plucked (by another hand) while it lasts."""
+        string.resizing = True
+
     def end_resize(self, string: AirString, now: float) -> None:
         """A resize has ended: the string gets the same pluck grace period as a new one."""
+        string.resizing = False
         string.created_at = now
 
     def clear(self) -> None:

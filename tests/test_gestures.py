@@ -327,14 +327,93 @@ def test_pinching_hands_grace_and_cooldown_block_catching():
     strings.add((100.0, 300.0), (700.0, 300.0), DIAGONAL, now=0.0)
     pull = PullGesture()
     swipe = hand(0, (400.0, 420.0), False, (400.0, 200.0))
-    assert pull.update([swipe], strings, COMMIT_GRACE_S / 2, DT, DIAGONAL, set()) == []
-    assert len(pull.update([swipe], strings, 1.0, DT, DIAGONAL, set())) == 1
+    assert pull.update([swipe], strings, COMMIT_GRACE_S / 2, DT, DIAGONAL) == []
+    assert len(pull.update([swipe], strings, 1.0, DT, DIAGONAL)) == 1
     back = hand(0, (400.0, 200.0), False, (400.0, 420.0))
-    assert pull.update([back], strings, 1.0 + PLUCK_COOLDOWN_S / 2, DT, DIAGONAL, set()) == []
-    assert len(pull.update([back], strings, 1.0 + PLUCK_COOLDOWN_S * 1.5, DT, DIAGONAL, set())) == 1
-    # A string being resized cannot be caught.
-    [string] = strings.strings
-    assert pull.update([swipe], strings, 5.0, DT, DIAGONAL, {string.string_id}) == []
+    assert pull.update([back], strings, 1.0 + PLUCK_COOLDOWN_S / 2, DT, DIAGONAL) == []
+    assert len(pull.update([back], strings, 1.0 + PLUCK_COOLDOWN_S * 1.5, DT, DIAGONAL)) == 1
+
+
+# --- pluck while resizing -----------------------------------------------------
+
+
+def test_other_hand_plucks_a_string_being_resized_at_its_current_note():
+    rig = Rig(((100.0, 300.0), (700.0, 300.0)))  # 600 px
+    [string] = rig.strings.strings
+    original = string.midi
+    rig.step(hand(0, (700.0, 300.0), True), rig.finger(1, (400.0, 200.0)))  # hand 0 grabs the right end
+    rig.step(hand(0, (800.0, 300.0), True), rig.finger(1, (400.0, 200.0)))  # 700 px
+    stretched = rig.strings.note_for_length(700.0, DIAGONAL)
+    assert stretched != original
+
+    # Hand 1 swipes down through it while hand 0 keeps holding the endpoint.
+    [pluck] = rig.step(hand(0, (800.0, 300.0), True), rig.finger(1, (400.0, 420.0)))
+    assert pluck.string is string and string.midi == stretched
+    assert pluck.position == pytest.approx(300.0 / 700.0)
+    [stretch] = rig.view.stretches  # still resizing, ruler on the plucked note
+    assert stretch.string_id == string.string_id and stretch.midi == stretched
+
+    # Resize to another note and pluck again (back up): the new note is used.
+    plucks = []
+    for x in (700.0, 600.0, 500.0):  # 400 px
+        plucks += rig.step(hand(0, (x, 300.0), True), rig.finger(1, (400.0, 420.0)))
+    assert plucks == []
+    rig.wait(PLUCK_COOLDOWN_S)
+    shorter = rig.strings.note_for_length(400.0, DIAGONAL)
+    assert shorter not in (original, stretched)
+    [pluck] = rig.step(hand(0, (500.0, 300.0), True), rig.finger(1, (400.0, 200.0)))
+    assert pluck.string is string and string.midi == shorter
+    assert pluck.position == pytest.approx(300.0 / 400.0)
+
+
+def test_a_string_being_resized_skips_the_commit_grace_which_restarts_after_release():
+    rig = Rig()
+    string = rig.strings.add((100.0, 300.0), (700.0, 300.0), DIAGONAL, now=rig.now)  # just drawn
+    rig.step(hand(0, (700.0, 300.0), True), rig.finger(1, (400.0, 200.0)))
+    [pluck] = rig.step(hand(0, (700.0, 300.0), True), rig.finger(1, (400.0, 420.0)))  # well within the grace
+    assert pluck.string is string
+    rig.wait(PLUCK_COOLDOWN_S)
+    rig.step(rig.finger(1, (400.0, 420.0)))  # hand 0 gone...
+    rig.step(rig.finger(1, (400.0, 420.0)))  # ...for two frames: the resize ends, the grace restarts
+    assert rig.view.stretches == ()
+    assert rig.step(rig.finger(1, (400.0, 200.0))) == []
+    rig.wait(COMMIT_GRACE_S)
+    assert len(rig.step(rig.finger(1, (400.0, 420.0)))) == 1
+
+
+def test_caught_string_follows_a_moving_endpoint_and_plucks_at_the_release_note():
+    rig = Rig(((100.0, 300.0), (700.0, 300.0)))  # 600 px: threshold 60 px
+    [string] = rig.strings.strings
+    rig.step(rig.finger(1, (400.0, 280.0)))
+    rig.step(rig.finger(1, (400.0, 305.0)))  # caught by hand 1
+    # Hand 0 grabs the right end of the caught string: it stays caught.
+    assert rig.step(hand(0, (700.0, 300.0), True), rig.finger(1, (400.0, 305.0))) == []
+    assert [bend.string for bend in rig.view.bends] == [string]
+    assert [stretch.string_id for stretch in rig.view.stretches] == [string.string_id]
+    for x in (750.0, 800.0, 850.0, 900.0):  # stretched to 800 px: threshold 80 px
+        assert rig.step(hand(0, (x, 300.0), True), rig.finger(1, (400.0, 305.0))) == []
+        [bend] = rig.view.bends
+        assert bend.position == pytest.approx(300.0 / (x - 100.0))  # the contact slides along the live string
+        assert bend.contact == (400.0, 305.0)
+    # 70 px would have slipped off the 600 px string, not the 800 px one.
+    assert rig.step(hand(0, (900.0, 300.0), True), rig.finger(1, (400.0, 370.0))) == []
+    [pluck] = rig.step(hand(0, (900.0, 300.0), True), rig.finger(1, (400.0, 390.0)))
+    assert pluck.string is string
+    assert string.midi == rig.strings.note_for_length(800.0, DIAGONAL)
+    assert string.midi != rig.strings.note_for_length(600.0, DIAGONAL)
+    assert pluck.position == pytest.approx(300.0 / 800.0)
+    assert pluck.velocity == pytest.approx(PULL_THRESHOLD_VELOCITY * 90.0 / 80.0)
+    assert pluck.origin == pytest.approx((400.0, 390.0))
+    assert rig.view.bends == ()
+
+
+def test_grabbing_hand_does_not_pluck_the_string_it_is_resizing():
+    rig = Rig(((100.0, 300.0), (500.0, 300.0)))
+    rig.step(hand(0, (500.0, 300.0), True))
+    # Pinch flickers open for a frame while the fingertip sweeps across the grabbed string.
+    assert rig.step(hand(0, (300.0, 400.0), False, previous_tip=(300.0, 200.0))) == []
+    assert rig.view.bends == ()
+    assert len(rig.view.stretches) == 1
 
 
 def test_threshold_has_an_absolute_minimum():
