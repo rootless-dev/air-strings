@@ -1,51 +1,70 @@
-import math
-
+import numpy as np
 import pytest
 
-from air_strings.ruler import ruler_marks
-from air_strings.scales import SCALES, PitchMapping
-
-DIAGONAL = math.hypot(1280, 720)
-MAPPING = PitchMapping()
-
-
-@pytest.mark.parametrize("scale", SCALES, ids=lambda s: s.name)
-def test_a_string_stretched_to_a_note_mark_plays_that_note(scale):
-    marks = ruler_marks(MAPPING, scale, 2 * DIAGONAL, DIAGONAL)
-    for mark in marks:
-        if mark.midi is not None:
-            length = mark.distance
-            assert MAPPING.note_for_length(length / DIAGONAL, SCALES[2]) == mark.midi
-            if mark.in_scale:
-                # Round trip: length -> note -> length lands back on the mark.
-                note = MAPPING.note_for_length(length / DIAGONAL, scale)
-                assert note == mark.midi
-                assert MAPPING.length_fraction(note) * DIAGONAL == pytest.approx(length)
+from air_strings.ruler import (
+    MAX_DIVISIONS,
+    MIN_DIVISIONS,
+    RULER_OFFSET_PX,
+    TICK_CENTER_PX,
+    TICK_MINOR_PX,
+    TICK_QUARTER_PX,
+    TICK_SPACING_PX,
+    divisions_for,
+    ruler_geometry,
+    tick_heights,
+)
 
 
-def test_tall_marks_are_exactly_the_scale_notes():
-    pentatonic = SCALES[0]
-    marks = ruler_marks(MAPPING, pentatonic, 2 * DIAGONAL, DIAGONAL)
-    assert sorted(m.midi for m in marks if m.in_scale) == pentatonic.notes()
-    semitones = [m for m in marks if m.midi is not None]
-    assert sorted(m.midi for m in semitones) == list(range(48, 73))
-    assert len([m for m in marks if m.midi is None]) == 24  # one half-step mark between neighbours
+@pytest.mark.parametrize("length", [50.0, 345.0, 700.0, 2000.0])
+def test_divisions_are_a_multiple_of_four_within_bounds(length):
+    divisions = divisions_for(length)
+    assert divisions % 4 == 0
+    assert MIN_DIVISIONS <= divisions <= MAX_DIVISIONS
 
 
-def test_marks_are_sorted_and_alternate_semitone_and_half_step():
-    marks = ruler_marks(MAPPING, SCALES[2], 2 * DIAGONAL, DIAGONAL)
-    distances = [m.distance for m in marks]
-    assert distances == sorted(distances)
-    kinds = [m.midi is None for m in marks]
-    assert kinds == [i % 2 == 1 for i in range(len(marks))]
-    # Shorter is higher, like a real string.
-    notes = [m.midi for m in marks if m.midi is not None]
-    assert notes == sorted(notes, reverse=True)
+def test_divisions_follow_the_tick_spacing():
+    assert divisions_for(12 * TICK_SPACING_PX) == 12
+    assert divisions_for(20 * TICK_SPACING_PX) == 20
 
 
-def test_marks_stop_at_the_requested_distance():
-    limit = MAPPING.length_fraction(60) * DIAGONAL  # a string playing C4
-    marks = ruler_marks(MAPPING, SCALES[0], limit + 1e-6, DIAGONAL)
-    assert all(m.distance <= limit + 1e-6 for m in marks)
-    assert min(m.midi for m in marks if m.midi is not None) == 60
-    assert ruler_marks(MAPPING, SCALES[0], 100.0, DIAGONAL) == []  # shorter than C5's length
+def test_tick_heights_look_like_a_ruler():
+    heights = tick_heights(12)  # ticks 1..11
+    assert heights.size == 11
+    assert heights[5] == TICK_CENTER_PX == heights.max()  # the middle, tick 6
+    assert heights[2] == heights[8] == TICK_QUARTER_PX  # the quarters, ticks 3 and 9
+    assert heights[0] == TICK_MINOR_PX == heights.min()
+    assert np.all(heights == heights[::-1])  # symmetric around the middle
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [((100.0, 300.0), (800.0, 320.0)), ((800.0, 320.0), (100.0, 300.0)), ((400.0, 100.0), (450.0, 600.0))],
+)
+def test_ticks_are_evenly_spaced_over_the_whole_string_and_point_away_from_it(a, b):
+    geometry = ruler_geometry(a, b)
+    start, end = np.asarray(a), np.asarray(b)
+    up = np.asarray(geometry.up)
+    assert up[1] <= 0  # above the string on screen
+
+    # The baseline runs parallel to the string, end to end, RULER_OFFSET_PX above it.
+    assert geometry.baseline == pytest.approx(np.stack([start, end]) + up * RULER_OFFSET_PX)
+
+    bases, tips = geometry.ticks[:, 0], geometry.ticks[:, 1]
+    along = (bases - start - up * RULER_OFFSET_PX) @ (end - start) / np.dot(end - start, end - start)
+    expected = np.arange(1, geometry.divisions) / geometry.divisions
+    assert along == pytest.approx(expected)  # evenly spaced, from one end to the other
+    assert (tips - bases) @ up == pytest.approx(tick_heights(geometry.divisions))  # away from the string
+
+
+def test_endpoint_marks_cross_the_endpoints_from_below_the_string_past_the_ruler():
+    a, b = (100.0, 300.0), (800.0, 300.0)
+    geometry = ruler_geometry(a, b)
+    for mark, endpoint in zip(geometry.endpoint_marks, (a, b)):
+        low, high = mark
+        assert low[0] == pytest.approx(endpoint[0]) and high[0] == pytest.approx(endpoint[0])  # across the endpoint
+        assert low[1] > endpoint[1]  # below the string
+        assert high[1] < endpoint[1] - RULER_OFFSET_PX  # past the ruler's baseline
+
+
+def test_degenerate_string_has_no_ruler():
+    assert ruler_geometry((10.0, 10.0), (10.2, 10.0)) is None

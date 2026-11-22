@@ -10,7 +10,6 @@ from air_strings.strings import (
     PLUCK_COOLDOWN_S,
     StringSet,
     mode_amplitudes,
-    visual_frequency,
 )
 
 DIAGONAL = math.hypot(1280, 720)
@@ -113,19 +112,15 @@ def test_pluck_with_displacement_starts_from_the_bent_shape():
     assert string.is_vibrating(1.0)
 
 
-def test_envelope_profile_bounds_the_vibration_and_decays():
+def test_amplitude_starts_at_the_bend_and_decays():
     strings = make_set()
     string = strings.add((100.0, 200.0), (700.0, 200.0), DIAGONAL, now=0.0)
-    xs = np.linspace(0, 1, 41)
-    string.pluck(1.0, 0.5, 1.0, displacement=50.0)
-    period = 1.0 / visual_frequency(string.frequency)
-    profile = string.envelope_profile(xs, 1.0)
-    over_a_period = np.array([np.abs(string.displacement(xs, 1.0 + period * k / 10)) for k in range(10)])
-    assert np.all(over_a_period <= profile + 0.5)
-    assert profile.max() > 35.0  # an "eye" as wide as the bend
-    assert profile[0] == pytest.approx(0.0, abs=1e-9)
-    assert string.envelope_profile(xs, 2.0).max() < profile.max()
-    assert string.envelope_profile(xs, 30.0).max() == 0.0
+    assert string.amplitude(1.0) == 0.0  # never plucked
+    string.pluck(1.0, 0.5, 1.0, displacement=-50.0)
+    assert string.amplitude(1.0) == pytest.approx(50.0)
+    assert 0.0 < string.amplitude(2.0) < string.amplitude(1.5) < 50.0
+    assert string.glow_level(1.0) == 1.0
+    assert string.glow_level(30.0) < 0.1
 
 
 def test_move_endpoint_retunes_the_string():

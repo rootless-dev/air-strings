@@ -59,13 +59,13 @@ class RecordingAudio:
 
 
 class RecordingRenderer(Renderer):
-    def __init__(self, mapping):
-        super().__init__(mapping)
+    def __init__(self):
+        super().__init__()
         self.views = []
 
-    def draw_frame(self, frame, hands, strings, gestures, particles, scale, now, hud_lines):
+    def draw_frame(self, frame, hands, strings, gestures, particles, now, hud_lines):
         self.views.append(gestures)
-        super().draw_frame(frame, hands, strings, gestures, particles, scale, now, hud_lines)
+        super().draw_frame(frame, hands, strings, gestures, particles, now, hud_lines)
 
 
 def make_app(monkeypatch, script, frames):
@@ -75,7 +75,7 @@ def make_app(monkeypatch, script, frames):
     strings = StringSet(mapping, SCALES[0])
     audio = RecordingAudio()
     particles = ParticleSystem(rng=np.random.default_rng(0))
-    renderer = RecordingRenderer(mapping)
+    renderer = RecordingRenderer()
     app = AirStringsApp(
         capture=FakeCapture(),
         tracker=ScriptedTracker(script),

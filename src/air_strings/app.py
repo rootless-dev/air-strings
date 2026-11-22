@@ -23,8 +23,8 @@ WINDOW_NAME = "air-strings"
 MAX_FAILED_READS = 30
 # Longest step the particles are advanced by, so a stalled frame does not fling them away.
 MAX_PARTICLE_DT_S = 0.1
-# Sparks are tinted halfway between white and the string's color.
-SPARK_WHITENESS = 0.55
+# Sparks are pale: mostly white, slightly tinted with the string's color.
+SPARK_WHITENESS = 0.8
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -116,7 +116,6 @@ class AirStringsApp:
             self._strings.strings,
             self._gestures.view(),
             self._particles,
-            self._strings.scale,
             now,
             hud,
         )
@@ -124,11 +123,8 @@ class AirStringsApp:
     def _on_pluck(self, pluck: Pluck) -> None:
         string = pluck.string
         self._audio.pluck(string.string_id, string.frequency, pluck.velocity, pluck.position)
-        length = max(string.length, 1e-9)
-        tangent = ((string.end[0] - string.start[0]) / length, (string.end[1] - string.start[1]) / length)
-        normal = (-tangent[1], tangent[0])
         tint = tuple(SPARK_WHITENESS * 255.0 + (1.0 - SPARK_WHITENESS) * c for c in string.color)
-        self._particles.emit(pluck.origin, tangent, normal, pluck.velocity, tint)
+        self._particles.emit(string.start, string.end, pluck.position, pluck.velocity, tint, pluck.displacement)
 
     def _handle_key(self, key: int) -> bool:
         """Returns False when the app should quit."""
@@ -171,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         strings=strings,
         gestures=GestureController(strings, DrawGesture(), GrabGesture(), PullGesture()),
         particles=ParticleSystem(),
-        renderer=Renderer(mapping),
+        renderer=Renderer(),
         audio=audio,
         max_frames=args.frames,
         headless=args.headless,

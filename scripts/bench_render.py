@@ -1,8 +1,8 @@
 """Measure how long one frame takes to draw at 1280x720 in a busy scene.
 
-Six strings (three vibrating, with glow and envelope trails, one caught on a
-fingertip), a full particle system, a ruler over a string being drawn, two hands
-and the HUD.
+Six strings (three vibrating as glowing ghost strands, one caught on a fingertip,
+all with their rulers), a full particle system, a bright ruler over a string being
+drawn, two hands and the HUD.
 
 Run with: uv run python scripts/bench_render.py
 """
@@ -43,9 +43,8 @@ def main() -> None:
     particles = ParticleSystem(rng=np.random.default_rng(0))
     for i in range(14):
         string = strings.strings[i % 6]
-        tint = tuple(0.55 * 255.0 + 0.45 * c for c in string.color)
-        origin = ((string.start[0] + string.end[0]) / 2, (string.start[1] + string.end[1]) / 2)
-        particles.emit(origin, (1.0, 0.0), (0.0, 1.0), 1.0, tint)
+        tint = tuple(0.8 * 255.0 + 0.2 * c for c in string.color)
+        particles.emit(string.start, string.end, 0.4, 1.0, tint, displacement=40.0)
         particles.update(0.04)
     assert particles.count == MAX_PARTICLES
 
@@ -59,7 +58,7 @@ def main() -> None:
     hands = [open_hand(0, (500.0, 400.0)), open_hand(1, (900.0, 300.0))]
     hud = ["Scale: C major pentatonic", "FPS: 30.0   strings: 6/6", "c: clear   s: scale   q/Esc: quit"]
 
-    renderer = Renderer(mapping)
+    renderer = Renderer()
     background = np.random.default_rng(1).integers(0, 120, (HEIGHT, WIDTH, 3), dtype=np.uint8)
     frame = background.copy()
     timings = []
@@ -67,7 +66,7 @@ def main() -> None:
         np.copyto(frame, background)
         now = 1.05 + index / 30 * 0.01  # keep the strings ringing
         start = time.perf_counter()
-        renderer.draw_frame(frame, hands, strings.strings, view, particles, strings.scale, now, hud)
+        renderer.draw_frame(frame, hands, strings.strings, view, particles, now, hud)
         timings.append(time.perf_counter() - start)
     timings_ms = np.array(timings[20:]) * 1000.0
     vibrating = sum(s.is_vibrating(1.05) for s in strings.strings)

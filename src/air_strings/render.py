@@ -1,19 +1,31 @@
-"""All OpenCV drawing: hands, strings (idle, pending, caught, vibrating with glow and trail),
-stretch rulers, spark particles and the HUD."""
+"""All OpenCV drawing: hands, strings, rulers, spark particles and the HUD.
+
+Strings (as glowing ghost strands), their glow, rulers, endpoint marks and sparks
+are drawn into one additive layer, which is then added onto the camera frame so
+they read as light. The pending string, note labels, hands and the HUD are drawn
+opaque on top. The shapes come from string_fx.py and ruler.py.
+"""
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import cv2
 import numpy as np
 
-from air_strings.geometry import Point, distance, midpoint, unit_normal
+from air_strings import string_fx
+from air_strings.geometry import Point, distance, midpoint, unit_normal, upper_normal
 from air_strings.gestures import Bend, GestureView, Stretch
 from air_strings.hands import Hand
 from air_strings.particles import ParticleSystem
-from air_strings.ruler import ruler_marks
-from air_strings.scales import PitchMapping, Scale, note_name
+from air_strings.ruler import (
+    ENDPOINT_MARK_ABOVE_PX,
+    RULER_OFFSET_PX,
+    TICK_CENTER_PX,
+    ruler_geometry,
+)
+from air_strings.scales import note_name
 from air_strings.strings import AirString
 
 HAND_CONNECTIONS = (
@@ -27,73 +39,102 @@ HAND_CONNECTIONS = (
 BONE_COLOR = (0, 220, 0)
 JOINT_COLOR = (0, 0, 255)
 PINCH_COLOR = (255, 255, 255)
-IDLE_COLOR = (235, 235, 235)
 PENDING_COLOR = (255, 255, 255)
-CAUGHT_COLOR = (200, 255, 225)
-TEXT_COLOR = (240, 240, 240)
+TEXT_COLOR = (225, 225, 225)
+LIVE_NOTE_COLOR = (150, 255, 205)
 SHADOW_COLOR = (25, 25, 25)
-
-STRING_SAMPLES = 64
-TICK_COUNT = 16
-GLOW_DOWNSCALE = 4
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-# The vibration's envelope ("eye") lines: additive, at this fraction of the string color.
-TRAIL_INTENSITY = 0.3
-# Sparks are also drawn, blurred, into the glow layer at this fraction of their color.
-SPARK_GLOW_INTENSITY = 0.45
+STRING_SAMPLES = 97
+GRADIENT_CHUNKS = 6  # a strand is drawn in this many pieces, each in its own color of the gradient
+GLOW_CHUNKS = 3
+SUBPIXEL_BITS = 2  # lines are drawn with 1/4 pixel precision
+SUBPIXEL = 1 << SUBPIXEL_BITS
+
+# Strand cores: idle strings are a subtle, nearly white line; vibrating (or held)
+# strings brighten and take on more of the gradient's color.
+IDLE_BRIGHTNESS = 0.75
+IDLE_TINT = 0.0
+ACTIVE_TINT = 0.42
+ENDPOINT_RADIUS_PX = 5
+
+# Glow: drawn at half resolution and blurred only a little, so the aura stays narrow.
+GLOW_DOWNSCALE = 2
+GLOW_SIGMA = 1.5  # in downscaled pixels
+GLOW_THICKNESS = 2  # in downscaled pixels
+GLOW_GAIN = 0.9
+ENDPOINT_GLOW_RADIUS = 2  # in downscaled pixels
+ENDPOINT_GLOW_GAIN = 0.6
+HELD_GLOW_PX = 25.0  # a held string glows fully once pulled this far from its rest line
+SPARK_THICKNESS = 1
+SPARK_GLOW_INTENSITY = 0.4
 # Spark colors are quantized to this step per channel so they can be drawn in batches.
 STREAK_COLOR_STEP = 16
 
-RULER_OFFSET_PX = 16.0  # from the string to the ruler's baseline, on the upper side
-RULER_TALL_PX = 12.0  # notes of the active scale
-RULER_SHORT_PX = 6.0  # other semitones
-RULER_HALF_PX = 3.5  # half-step marks between semitones
-RULER_CURRENT_PX = 17.0  # the note the string plays now
-# The ruler runs this far (fraction of the frame diagonal) past the moving end,
-# so the next notes are visible before the string gets there.
-RULER_LOOKAHEAD_FRACTION = 0.03
-RULER_COLOR = (215, 215, 215)
-RULER_AHEAD_COLOR = (120, 120, 120)
-RULER_CURRENT_COLOR = (150, 255, 205)
+RULER_COLOR = (190, 190, 190)  # while a string is drawn or resized
+RULER_MARK_COLOR = (235, 235, 235)
+RULER_DIM_COLOR = (85, 85, 85)  # on committed strings
+RULER_DIM_MARK_COLOR = (175, 175, 175)
 
 
 def _int_point(p) -> tuple[int, int]:
     return (int(round(p[0])), int(round(p[1])))
 
 
-def _upper_normal(a: Point, b: Point) -> tuple[float, float]:
-    """Unit normal of a->b pointing up on screen (towards smaller y; left for vertical lines)."""
-    nx, ny = unit_normal(a, b)
-    if ny > 0 or (ny == 0 and nx > 0):
-        nx, ny = -nx, -ny
-    return nx, ny
+def _fixed(points: np.ndarray) -> np.ndarray:
+    """Pixel coordinates as int32 fixed point, for drawing with `shift=SUBPIXEL_BITS`."""
+    return np.round(points * SUBPIXEL).astype(np.int32)
 
 
-def _bent_points(string: AirString, bend: Bend, xs: np.ndarray) -> np.ndarray:
-    """Points at xs (0..1) of a string bent into two straight segments through the contact point."""
-    start = np.asarray(string.start, dtype=np.float64)
-    end = np.asarray(string.end, dtype=np.float64)
-    contact = np.asarray(bend.contact, dtype=np.float64)
-    u = min(1.0 - 1e-3, max(1e-3, bend.position))
-    left = xs <= u
-    out = np.empty((xs.size, 2))
-    out[left] = start + np.outer(xs[left] / u, contact - start)
-    out[~left] = contact + np.outer((xs[~left] - u) / (1.0 - u), end - contact)
-    return out
+def _bgr(color) -> tuple[int, int, int]:
+    return tuple(int(min(255.0, max(0.0, c))) for c in color)
 
 
-def _text_with_shadow(frame: np.ndarray, text: str, origin: Point, scale: float, color) -> None:
-    x, y = _int_point(origin)
+def _bgr_table(colors: np.ndarray) -> list:
+    """Float colors (..., 3) as nested lists of int BGR triples, clipped to 0..255."""
+    return np.clip(colors, 0.0, 255.0).astype(np.int32).tolist()
+
+
+def _chunk_slices(samples: int, chunks: int) -> list[slice]:
+    """Overlapping slices (they share their end points) that cover `samples` points in `chunks` pieces."""
+    edges = np.linspace(0, samples - 1, chunks + 1).round().astype(int)
+    return [slice(int(a), int(b) + 1) for a, b in itertools.pairwise(edges)]
+
+
+def _text_with_shadow(frame: np.ndarray, text: str, center: Point, scale: float, color) -> None:
+    (width, height), _ = cv2.getTextSize(text, FONT, scale, 1)
+    x, y = _int_point((center[0] - width / 2.0, center[1] + height / 2.0))
     cv2.putText(frame, text, (x + 1, y + 1), FONT, scale, SHADOW_COLOR, 2, cv2.LINE_AA)
     cv2.putText(frame, text, (x, y), FONT, scale, color, 1, cv2.LINE_AA)
 
 
+class _Box:
+    """Bounding box of everything drawn into the glow layer, in full-resolution pixels."""
+
+    def __init__(self) -> None:
+        self.x0 = self.y0 = math.inf
+        self.x1 = self.y1 = -math.inf
+
+    def add(self, points: np.ndarray) -> None:
+        flat = points.reshape(-1, 2)
+        low, high = flat.min(axis=0), flat.max(axis=0)
+        self.x0, self.y0 = min(self.x0, low[0]), min(self.y0, low[1])
+        self.x1, self.y1 = max(self.x1, high[0]), max(self.y1, high[1])
+
+    @property
+    def empty(self) -> bool:
+        return self.x0 > self.x1
+
+
 class Renderer:
-    def __init__(self, mapping: PitchMapping) -> None:
-        self._mapping = mapping
+    def __init__(self) -> None:
         self._xs = np.linspace(0.0, 1.0, STRING_SAMPLES)
-        self._tick_xs = np.arange(1, TICK_COUNT) / TICK_COUNT
+        self._chunks = _chunk_slices(STRING_SAMPLES, GRADIENT_CHUNKS)
+        self._glow_chunks = _chunk_slices(STRING_SAMPLES, GLOW_CHUNKS)
+        self._chunk_mids = np.array([(s.start + s.stop - 1) / 2.0 for s in self._chunks]) / (STRING_SAMPLES - 1)
+        self._glow_mids = np.array([(s.start + s.stop - 1) / 2.0 for s in self._glow_chunks]) / (STRING_SAMPLES - 1)
+        self._layer = np.zeros((0, 0, 3), dtype=np.uint8)
+        self._glow = np.zeros((0, 0, 3), dtype=np.uint8)
 
     def draw_frame(
         self,
@@ -102,29 +143,123 @@ class Renderer:
         strings: list[AirString],
         gestures: GestureView,
         particles: ParticleSystem,
-        scale: Scale,
         now: float,
         hud_lines: list[str],
     ) -> None:
+        layer, glow = self._clear_layers(frame.shape)
+        box = _Box()
         bends = {bend.string.string_id: bend for bend in gestures.bends}
-        resizing = {s.string_id for s in gestures.stretches if s.string_id is not None}
-        self._draw_strings(frame, strings, bends, resizing, particles, now)
+        stretched = {s.string_id for s in gestures.stretches if s.string_id is not None}
+        for string in strings:
+            self._draw_string(layer, glow, box, string, bends.get(string.string_id), now)
+            if string.string_id not in stretched:  # a stretched string shows the bright ruler instead
+                self._draw_ruler(layer, string.start, string.end, RULER_DIM_COLOR, RULER_DIM_MARK_COLOR)
+        for stretch in gestures.stretches:
+            self._draw_ruler(layer, stretch.anchor, stretch.moving, RULER_COLOR, RULER_MARK_COLOR)
+        self._draw_sparks(layer, glow, box, particles)
+        self._compose_glow(layer, glow, box)
+        cv2.add(frame, layer, dst=frame)
+
         if gestures.pending is not None:
             self._draw_pending(frame, *gestures.pending)
+        for string in strings:
+            if string.string_id not in stretched:
+                self._draw_label(frame, string)
         for stretch in gestures.stretches:
-            self._draw_ruler(frame, stretch, scale)
+            self._draw_live_note(frame, stretch)
         for hand in hands:
             self._draw_hand(frame, hand)
         self._draw_hud(frame, hud_lines)
 
-    def _draw_hand(self, frame: np.ndarray, hand: Hand) -> None:
-        points = [_int_point(p) for p in hand.points]
-        for a, b in HAND_CONNECTIONS:
-            cv2.line(frame, points[a], points[b], BONE_COLOR, 2, cv2.LINE_AA)
-        for p in points:
-            cv2.circle(frame, p, 4, JOINT_COLOR, -1, cv2.LINE_AA)
-        if hand.pinching:
-            cv2.circle(frame, _int_point(hand.pinch_point), 9, PINCH_COLOR, 2, cv2.LINE_AA)
+    def _clear_layers(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+        height, width = shape[:2]
+        if self._layer.shape[:2] != (height, width):
+            self._layer = np.zeros((height, width, 3), dtype=np.uint8)
+            small = (-(-height // GLOW_DOWNSCALE), -(-width // GLOW_DOWNSCALE), 3)
+            self._glow = np.zeros(small, dtype=np.uint8)
+        else:
+            self._layer.fill(0)
+            self._glow.fill(0)
+        return self._layer, self._glow
+
+    # Strings
+
+    def _draw_string(
+        self, layer: np.ndarray, glow: np.ndarray, box: _Box, string: AirString, bend: Bend | None, now: float
+    ) -> None:
+        xs = self._xs
+        if bend is not None:
+            offsets, weights = string_fx.held_strands(string, bend.position, bend.contact, xs, now)
+            level = min(1.0, abs(string_fx.pull_depth(string.start, string.end, bend.contact)) / HELD_GLOW_PX)
+        elif string.is_vibrating(now):
+            offsets, weights = string_fx.vibration_strands(string, xs, now)
+            level = string.glow_level(now)
+        else:
+            offsets, weights, level = np.zeros((1, xs.size)), np.ones(1), 0.0
+
+        start = np.asarray(string.start, dtype=np.float64)
+        end = np.asarray(string.end, dtype=np.float64)
+        normal = np.asarray(unit_normal(string.start, string.end), dtype=np.float64)
+        base = start + np.outer(xs, end - start)
+        curves = base[None, :, :] + offsets[:, :, None] * normal  # (strands, points, 2)
+
+        # Core colors: from nearly white (idle) towards the gradient, brighter when active.
+        tint = IDLE_TINT + (ACTIVE_TINT - IDLE_TINT) * level
+        brightness = IDLE_BRIGHTNESS + (1.0 - IDLE_BRIGHTNESS) * level
+        mids = string_fx.gradient_positions(string.start, string.end, self._chunk_mids)
+        gradient = string_fx.gradient_colors(mids, string_fx.CORE_LEFT, string_fx.CORE_RIGHT)
+        cores = brightness * ((1.0 - tint) * 255.0 + tint * gradient)
+        strand_colors = _bgr_table(weights[:, None, None] * cores[None, :, :])  # [strand][chunk]
+        fixed = _fixed(curves)
+        for index, weight in enumerate(weights):
+            if weight < 0.02:
+                continue
+            thickness = 2 if index == 0 else 1
+            for chunk, color in zip(self._chunks, strand_colors[index]):
+                cv2.polylines(layer, [fixed[index, chunk]], False, color, thickness, cv2.LINE_AA, SUBPIXEL_BITS)
+
+        ends = string_fx.gradient_positions(string.start, string.end, np.array([0.0, 1.0]))
+        end_colors = string_fx.gradient_colors(ends, string_fx.CORE_LEFT, string_fx.CORE_RIGHT)
+        for point, color in zip((string.start, string.end), end_colors):
+            ring = brightness * (0.5 * 255.0 + 0.5 * color)
+            cv2.circle(layer, _int_point(point), ENDPOINT_RADIUS_PX, _bgr(ring), 1, cv2.LINE_AA)
+
+        if level > 0.0:
+            self._draw_strand_glow(glow, curves, weights, level, ends)
+            box.add(curves)
+
+    def _draw_strand_glow(
+        self, glow: np.ndarray, curves: np.ndarray, weights: np.ndarray, level: float, ends: np.ndarray
+    ) -> None:
+        """Strands and endpoints in the saturated gradient, into the (downscaled) glow layer.
+
+        `ends` are the gradient positions (0: left on screen, 1: right) of the string's start and end.
+        """
+        mids = ends[0] + (ends[1] - ends[0]) * self._glow_mids
+        glows = string_fx.gradient_colors(mids, string_fx.GLOW_LEFT, string_fx.GLOW_RIGHT) * (GLOW_GAIN * level)
+        glow_colors = _bgr_table(weights[:, None, None] * glows[None, :, :])
+        fixed_small = _fixed(curves / GLOW_DOWNSCALE)
+        # The glow is blurred afterwards: plain (not anti-aliased) lines are enough, and cheaper.
+        for index, weight in enumerate(weights):
+            if weight < 0.02:
+                continue
+            for chunk, color in zip(self._glow_chunks, glow_colors[index]):
+                cv2.polylines(
+                    glow, [fixed_small[index, chunk]], False, color, GLOW_THICKNESS, cv2.LINE_8, SUBPIXEL_BITS
+                )
+        end_glows = string_fx.gradient_colors(ends, string_fx.GLOW_LEFT, string_fx.GLOW_RIGHT)
+        endpoints = curves[0, [0, -1]]
+        for point, color in zip(endpoints, _bgr_table(end_glows * (ENDPOINT_GLOW_GAIN * level))):
+            center = tuple(int(v) for v in _fixed(point / GLOW_DOWNSCALE))
+            cv2.circle(glow, center, ENDPOINT_GLOW_RADIUS * SUBPIXEL, color, -1, cv2.LINE_8, SUBPIXEL_BITS)
+
+    def _draw_label(self, frame: np.ndarray, string: AirString) -> None:
+        """The string's note, small, above the middle of its ruler."""
+        up = upper_normal(string.start, string.end)
+        center = midpoint(string.start, string.end)
+        lift = RULER_OFFSET_PX + TICK_CENTER_PX + 14.0
+        anchor = (center[0] + up[0] * lift, center[1] + up[1] * lift)
+        _text_with_shadow(frame, string.note_name, anchor, 0.45, TEXT_COLOR)
 
     def _draw_pending(self, frame: np.ndarray, a: Point, b: Point) -> None:
         length = distance(a, b)
@@ -140,85 +275,42 @@ class Renderer:
         for p in (a, b):
             cv2.circle(frame, _int_point(p), 6, PENDING_COLOR, 2, cv2.LINE_AA)
 
-    def _draw_strings(
-        self,
-        frame: np.ndarray,
-        strings: list[AirString],
-        bends: dict[int, Bend],
-        resizing: set[int],
-        particles: ParticleSystem,
-        now: float,
-    ) -> None:
-        vibrating = [s for s in strings if s.string_id not in bends and s.is_vibrating(now)]
-        if vibrating or particles.count:
-            self._add_glow(frame, vibrating, particles, now)
-        vibrating_ids = {s.string_id for s in vibrating}
-        for string in strings:
-            bend = bends.get(string.string_id)
-            if bend is not None:
-                color = CAUGHT_COLOR
-                corners = np.array([string.start, bend.contact, string.end])
-                cv2.polylines(frame, [np.round(corners).astype(np.int32)], False, color, 2, cv2.LINE_AA)
-                cv2.circle(frame, _int_point(bend.contact), 3, color, -1, cv2.LINE_AA)
-                tick_points = _bent_points(string, bend, self._tick_xs)
-            elif string.string_id in vibrating_ids:
-                color = tuple(min(255, c + 120) for c in string.color)
-                curve = string.points(self._xs, now).astype(np.int32)
-                cv2.polylines(frame, [curve], False, color, 2, cv2.LINE_AA)
-                tick_points = string.points(self._tick_xs, now)
-            else:
-                color = IDLE_COLOR
-                curve = string.points(self._xs, now).astype(np.int32)
-                cv2.polylines(frame, [curve], False, color, 1, cv2.LINE_AA)
-                tick_points = string.points(self._tick_xs, now)
-            self._draw_ticks(frame, string, tick_points, color)
-            if string.string_id in resizing:
-                cv2.circle(frame, _int_point(string.start), 5, PENDING_COLOR, 1, cv2.LINE_AA)
-                cv2.circle(frame, _int_point(string.end), 5, PENDING_COLOR, 1, cv2.LINE_AA)
-            else:  # while resizing, the ruler shows the live note instead
-                self._draw_label(frame, string)
+    # Rulers
 
-    def _add_glow(self, frame: np.ndarray, strings: list[AirString], particles: ParticleSystem, now: float) -> None:
-        """One additive layer: blurred glow (strings, sparks), then crisp trails and sparks."""
-        height, width = frame.shape[:2]
-        small_size = (width // GLOW_DOWNSCALE, height // GLOW_DOWNSCALE)
-        glow = np.zeros((small_size[1], small_size[0], 3), dtype=np.uint8)
-        for string in strings:
-            curve = (string.points(self._xs, now) / GLOW_DOWNSCALE).astype(np.int32)
-            level = string.glow_level(now)
-            color = tuple(int(c * level) for c in string.color)
-            cv2.polylines(glow, [curve], False, color, 3, cv2.LINE_AA)
+    @staticmethod
+    def _draw_ruler(layer: np.ndarray, a: Point, b: Point, color, mark_color) -> None:
+        geometry = ruler_geometry(a, b)
+        if geometry is None:
+            return
+        lines = [_fixed(geometry.baseline)] + list(_fixed(geometry.ticks))
+        cv2.polylines(layer, lines, False, color, 1, cv2.LINE_AA, SUBPIXEL_BITS)
+        cv2.polylines(layer, list(_fixed(geometry.endpoint_marks)), False, mark_color, 1, cv2.LINE_AA, SUBPIXEL_BITS)
+
+    def _draw_live_note(self, frame: np.ndarray, stretch: Stretch) -> None:
+        """The note a string being stretched plays now, above its moving end."""
+        up = upper_normal(stretch.anchor, stretch.moving)
+        lift = RULER_OFFSET_PX + ENDPOINT_MARK_ABOVE_PX + 12.0
+        center = (stretch.moving[0] + up[0] * lift, stretch.moving[1] + up[1] * lift)
+        _text_with_shadow(frame, note_name(stretch.midi), center, 0.55, LIVE_NOTE_COLOR)
+
+    # Sparks and glow
+
+    def _draw_sparks(self, layer: np.ndarray, glow: np.ndarray, box: _Box, particles: ParticleSystem) -> None:
         heads, tails, colors = particles.streaks()
-        if len(heads):
-            small_colors = colors * SPARK_GLOW_INTENSITY
-            self._draw_streaks(glow, heads / GLOW_DOWNSCALE, tails / GLOW_DOWNSCALE, small_colors, 2, cv2.LINE_8)
-        glow = cv2.GaussianBlur(glow, (0, 0), 2.5)
-        layer = cv2.resize(glow, (width, height), interpolation=cv2.INTER_LINEAR)
-        for string in strings:
-            self._draw_trail(layer, string, now)
-        if len(heads):
-            self._draw_streaks(layer, heads, tails, colors, 1, cv2.LINE_AA)
-        cv2.add(frame, layer, dst=frame)
-
-    def _draw_trail(self, layer: np.ndarray, string: AirString, now: float) -> None:
-        """Upper and lower envelope of the vibration: an 'eye' that shrinks as it decays."""
-        profile = string.envelope_profile(self._xs, now)
-        start = np.asarray(string.start, dtype=np.float64)
-        end = np.asarray(string.end, dtype=np.float64)
-        normal = np.asarray(unit_normal(string.start, string.end), dtype=np.float64)
-        base = start + np.outer(self._xs, end - start)
-        offset = np.outer(profile, normal)
-        level = string.glow_level(now)
-        color = tuple(int(c * TRAIL_INTENSITY * level) for c in string.color)
-        lines = [np.round(base + offset).astype(np.int32), np.round(base - offset).astype(np.int32)]
-        cv2.polylines(layer, lines, False, color, 1, cv2.LINE_AA)
+        if not len(heads):
+            return
+        self._draw_streaks(layer, heads, tails, colors, SPARK_THICKNESS, cv2.LINE_AA)
+        small_colors = colors * SPARK_GLOW_INTENSITY
+        self._draw_streaks(glow, heads / GLOW_DOWNSCALE, tails / GLOW_DOWNSCALE, small_colors, 1, cv2.LINE_AA)
+        box.add(heads)
+        box.add(tails)
 
     @staticmethod
     def _draw_streaks(
         image: np.ndarray, heads: np.ndarray, tails: np.ndarray, colors: np.ndarray, thickness: int, line_type: int
     ) -> None:
         """Draw segments tail->head, batched into one polylines call per (quantized) color."""
-        segments = np.round(np.stack([tails, heads], axis=1)).astype(np.int32)  # (n, 2, 2)
+        segments = _fixed(np.stack([tails, heads], axis=1))  # (n, 2, 2)
         quantized = (np.clip(colors, 0, 255) // STREAK_COLOR_STEP).astype(np.int32)
         palette, groups = np.unique(quantized, axis=0, return_inverse=True)
         groups = groups.reshape(-1)
@@ -226,63 +318,38 @@ class Renderer:
             if not color.any():
                 continue  # fully faded
             bgr = tuple(int(c) * STREAK_COLOR_STEP + STREAK_COLOR_STEP // 2 for c in color)
-            cv2.polylines(image, list(segments[groups == index]), False, bgr, thickness, line_type)
+            cv2.polylines(image, list(segments[groups == index]), False, bgr, thickness, line_type, SUBPIXEL_BITS)
 
-    def _draw_ticks(self, frame: np.ndarray, string: AirString, points: np.ndarray, color) -> None:
-        nx, ny = unit_normal(string.start, string.end)
-        for index, (x, y) in enumerate(points, start=1):
-            half = 7.0 if index % 4 == 0 else 4.0
-            p0 = (x - nx * half, y - ny * half)
-            p1 = (x + nx * half, y + ny * half)
-            cv2.line(frame, _int_point(p0), _int_point(p1), color, 1, cv2.LINE_AA)
-
-    def _draw_label(self, frame: np.ndarray, string: AirString) -> None:
-        nx, ny = _upper_normal(string.start, string.end)
-        cx, cy = midpoint(string.start, string.end)
-        anchor = (cx + nx * 26.0 - 14.0, cy + ny * 26.0 + 6.0)
-        cv2.putText(frame, string.note_name, _int_point(anchor), FONT, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, string.note_name, _int_point(anchor), FONT, 0.6, TEXT_COLOR, 1, cv2.LINE_AA)
-
-    def _draw_ruler(self, frame: np.ndarray, stretch: Stretch, scale: Scale) -> None:
-        """A measuring ruler just above the string: one mark per note length, from the anchor."""
-        a, b = stretch.anchor, stretch.moving
-        length = distance(a, b)
-        if length < 1.0:
+    @staticmethod
+    def _compose_glow(layer: np.ndarray, glow: np.ndarray, box: _Box) -> None:
+        """Blur the glow layer around what was drawn into it, upscale it and add it to `layer`."""
+        if box.empty:
             return
-        height, width = frame.shape[:2]
-        diagonal = math.hypot(width, height)
-        tx, ty = (b[0] - a[0]) / length, (b[1] - a[1]) / length
-        nx, ny = _upper_normal(a, b)
-        ox, oy = a[0] + nx * RULER_OFFSET_PX, a[1] + ny * RULER_OFFSET_PX
-        marks = ruler_marks(self._mapping, scale, length + RULER_LOOKAHEAD_FRACTION * diagonal, diagonal)
+        small_height, small_width = glow.shape[:2]
+        pad = math.ceil(3.0 * GLOW_SIGMA) + GLOW_THICKNESS + ENDPOINT_GLOW_RADIUS
+        x0 = max(0, int(box.x0 // GLOW_DOWNSCALE) - pad)
+        y0 = max(0, int(box.y0 // GLOW_DOWNSCALE) - pad)
+        x1 = min(small_width, int(box.x1 // GLOW_DOWNSCALE) + pad + 1)
+        y1 = min(small_height, int(box.y1 // GLOW_DOWNSCALE) + pad + 1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        blurred = cv2.GaussianBlur(glow[y0:y1, x0:x1], (0, 0), GLOW_SIGMA)
+        size = ((x1 - x0) * GLOW_DOWNSCALE, (y1 - y0) * GLOW_DOWNSCALE)
+        upscaled = cv2.resize(blurred, size, interpolation=cv2.INTER_LINEAR)
+        target = layer[y0 * GLOW_DOWNSCALE : y1 * GLOW_DOWNSCALE, x0 * GLOW_DOWNSCALE : x1 * GLOW_DOWNSCALE]
+        height, width = target.shape[:2]
+        target[:] = cv2.add(target, upscaled[:height, :width])
 
-        # Baseline: solid up to the moving end, dim where it runs ahead of it.
-        far = max([length] + [m.distance for m in marks])
-        moving_end = (ox + tx * length, oy + ty * length)
-        cv2.line(frame, _int_point((ox, oy)), _int_point(moving_end), RULER_COLOR, 1, cv2.LINE_AA)
-        if far > length:
-            ahead = (ox + tx * far, oy + ty * far)
-            cv2.line(frame, _int_point(moving_end), _int_point(ahead), RULER_AHEAD_COLOR, 1, cv2.LINE_AA)
+    # Hands and HUD
 
-        label_at = (ox + tx * length, oy + ty * length)
-        label_height = RULER_TALL_PX
-        for mark in marks:
-            base = (ox + tx * mark.distance, oy + ty * mark.distance)
-            if mark.midi == stretch.midi:
-                size, color = RULER_CURRENT_PX, RULER_CURRENT_COLOR
-                label_at, label_height = base, size
-            else:
-                size = RULER_TALL_PX if mark.in_scale else RULER_SHORT_PX if mark.midi is not None else RULER_HALF_PX
-                color = RULER_AHEAD_COLOR if mark.distance > length else RULER_COLOR
-            tip = (base[0] + nx * size, base[1] + ny * size)
-            thickness = 2 if mark.midi == stretch.midi else 1
-            cv2.line(frame, _int_point(base), _int_point(tip), color, thickness, cv2.LINE_AA)
-
-        text = note_name(stretch.midi)
-        (text_width, text_height), _ = cv2.getTextSize(text, FONT, 0.55, 1)
-        center = (label_at[0] + nx * (label_height + 12.0), label_at[1] + ny * (label_height + 12.0))
-        origin = (center[0] - text_width / 2.0, center[1] + text_height / 2.0)
-        _text_with_shadow(frame, text, origin, 0.55, RULER_CURRENT_COLOR)
+    def _draw_hand(self, frame: np.ndarray, hand: Hand) -> None:
+        points = [_int_point(p) for p in hand.points]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(frame, points[a], points[b], BONE_COLOR, 2, cv2.LINE_AA)
+        for p in points:
+            cv2.circle(frame, p, 4, JOINT_COLOR, -1, cv2.LINE_AA)
+        if hand.pinching:
+            cv2.circle(frame, _int_point(hand.pinch_point), 9, PINCH_COLOR, 2, cv2.LINE_AA)
 
     def _draw_hud(self, frame: np.ndarray, lines: list[str]) -> None:
         line_height = 22

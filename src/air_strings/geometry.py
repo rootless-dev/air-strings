@@ -82,3 +82,11 @@ def unit_normal(a: Point, b: Point) -> Point:
     if length < _EPSILON:
         return (0.0, 0.0)
     return (-dy / length, dx / length)
+
+
+def upper_normal(a: Point, b: Point) -> Point:
+    """Unit normal of a->b pointing up on screen (towards smaller y; left for vertical lines)."""
+    nx, ny = unit_normal(a, b)
+    if ny > 0 or (ny == 0 and nx > 0):
+        nx, ny = -nx, -ny
+    return nx, ny

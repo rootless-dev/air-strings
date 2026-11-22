@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from air_strings.geometry import Point, crossing_position, distance, unit_normal
+from air_strings.geometry import Point, crossing_position, distance
 from air_strings.scales import PitchMapping, Scale, midi_to_frequency, note_name
 from air_strings.synth import note_t60
 
@@ -18,8 +18,6 @@ COMMIT_GRACE_S = 0.3
 VISUAL_MODES = 6
 MAX_VISUAL_AMPLITUDE_PX = 45.0
 VISIBLE_THRESHOLD_PX = 0.5
-# Phases sampled over one fundamental period to find the vibration's envelope.
-ENVELOPE_PHASES = 24
 
 # BGR colors for vibrating strings: greens and cyans.
 STRING_COLORS = (
@@ -100,16 +98,16 @@ class AirString:
         tau = note_t60(self.frequency) / math.log(1000.0)
         return self.pluck_amplitude * math.exp(-elapsed / tau)
 
-    def _envelope(self, now: float) -> float:
+    def amplitude(self, now: float) -> float:
         """Current vibration amplitude in pixels."""
         return abs(self._decay(now))
 
     def is_vibrating(self, now: float) -> bool:
-        return self._envelope(now) > VISIBLE_THRESHOLD_PX
+        return self.amplitude(now) > VISIBLE_THRESHOLD_PX
 
     def glow_level(self, now: float) -> float:
         """0..1 glow intensity that fades out as the vibration dies down."""
-        return min(1.0, self._envelope(now) / 8.0)
+        return min(1.0, self.amplitude(now) / 8.0)
 
     def displacement(self, xs: np.ndarray, now: float) -> np.ndarray:
         """Offset in pixels, along the string normal, at positions xs (0..1)."""
@@ -121,29 +119,6 @@ class AirString:
         phases = np.cos(2.0 * math.pi * n * visual_frequency(self.frequency) * elapsed)
         shapes = np.sin(np.pi * np.outer(n, xs))  # (modes, points)
         return peak * ((self._modes * phases) @ shapes)
-
-    def envelope_profile(self, xs: np.ndarray, now: float) -> np.ndarray:
-        """Largest |displacement| each position xs reaches over one vibration period, right now.
-
-        The modes are harmonics, so the motion repeats every fundamental period:
-        sampling phases over one period gives the envelope ("eye") of the
-        vibration, which shrinks as the vibration decays.
-        """
-        envelope = self._envelope(now)
-        if envelope <= VISIBLE_THRESHOLD_PX:
-            return np.zeros_like(xs)
-        n = np.arange(1, VISUAL_MODES + 1, dtype=np.float64)
-        phases = np.cos(2.0 * math.pi * np.outer(np.arange(ENVELOPE_PHASES) / ENVELOPE_PHASES, n))
-        shapes = np.sin(np.pi * np.outer(n, xs))
-        return envelope * np.max(np.abs((phases * self._modes) @ shapes), axis=0)
-
-    def points(self, xs: np.ndarray, now: float) -> np.ndarray:
-        """Pixel coordinates (len(xs), 2) of the string at positions xs, including vibration."""
-        start = np.asarray(self.start, dtype=np.float64)
-        end = np.asarray(self.end, dtype=np.float64)
-        normal = np.asarray(unit_normal(self.start, self.end), dtype=np.float64)
-        base = start + np.outer(xs, end - start)
-        return base + np.outer(self.displacement(xs, now), normal)
 
 
 @dataclass(frozen=True)
