@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import threading
 import time
 
@@ -108,6 +110,36 @@ def test_worker_gives_up_after_too_many_failed_reads():
     assert worker.stop()
     assert isinstance(worker.error, CameraStoppedError)
     assert capture.reads == 5
+
+
+HUNG_CAMERA_SCRIPT = """
+import threading
+
+from air_strings.pipeline import DetectionWorker, LatestDetection
+
+
+class HungCapture:
+    def __init__(self):
+        self.reading = threading.Event()
+
+    def read(self):
+        self.reading.set()
+        threading.Event().wait()  # a camera that never answers
+
+
+capture = HungCapture()
+worker = DetectionWorker(capture, None, LatestDetection())
+worker.start()
+capture.reading.wait()
+assert not worker.stop(timeout=0.05)
+"""
+
+
+def test_a_worker_stuck_in_a_read_does_not_keep_the_process_alive():
+    result = subprocess.run([sys.executable, "-c", HUNG_CAMERA_SCRIPT], capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, result.stderr
+    assert "did not stop in time" in result.stderr
 
 
 def test_stop_before_start_is_a_no_op():

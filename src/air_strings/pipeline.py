@@ -130,7 +130,9 @@ class DetectionWorker:
         self._clock = clock
         self._max_failed_reads = max_failed_reads
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="air-strings-detection")
+        # Daemon: if `stop` times out (a read stuck on a hung camera), the thread is
+        # abandoned and must not keep the process alive at interpreter exit.
+        self._thread = threading.Thread(target=self._run, name="air-strings-detection", daemon=True)
         self.error: BaseException | None = None
 
     @property
