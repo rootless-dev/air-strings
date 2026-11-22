@@ -8,9 +8,9 @@ from air_strings.strings import (
     COMMIT_GRACE_S,
     MAX_STRINGS,
     PLUCK_COOLDOWN_S,
-    DrawGesture,
     StringSet,
     mode_amplitudes,
+    visual_frequency,
 )
 
 DIAGONAL = math.hypot(1280, 720)
@@ -71,21 +71,21 @@ def test_strum_crosses_several_strings_at_once():
     strings = make_set()
     for i in range(3):
         strings.add((100.0, 100.0 + 60 * i), (700.0, 100.0 + 60 * i), DIAGONAL, now=0.0)
-    plucks = strings.find_plucks((300.0, 50.0), (320.0, 300.0), now=1.0)
-    assert len(plucks) == 3
-    assert all(0.3 < p.position < 0.4 for p in plucks)
+    crossings = strings.find_crossings((300.0, 50.0), (320.0, 300.0), now=1.0)
+    assert len(crossings) == 3
+    assert all(0.3 < c.position < 0.4 for c in crossings)
 
 
 def test_cooldown_and_commit_grace_block_double_triggers():
     strings = make_set()
     strings.add((100.0, 200.0), (700.0, 200.0), DIAGONAL, now=0.0)
     down, up = ((400.0, 150.0), (400.0, 250.0)), ((400.0, 250.0), (400.0, 150.0))
-    assert strings.find_plucks(*down, now=COMMIT_GRACE_S / 2) == []
+    assert strings.find_crossings(*down, now=COMMIT_GRACE_S / 2) == []
     t = 1.0
-    [pluck] = strings.find_plucks(*down, now=t)
-    pluck.string.pluck(t, pluck.position, 0.5)
-    assert strings.find_plucks(*up, now=t + PLUCK_COOLDOWN_S / 2) == []
-    assert len(strings.find_plucks(*up, now=t + PLUCK_COOLDOWN_S * 1.5)) == 1
+    [crossing] = strings.find_crossings(*down, now=t)
+    crossing.string.pluck(t, crossing.position, 0.5)
+    assert strings.find_crossings(*up, now=t + PLUCK_COOLDOWN_S / 2) == []
+    assert len(strings.find_crossings(*up, now=t + PLUCK_COOLDOWN_S * 1.5)) == 1
 
 
 def test_plucked_string_vibrates_then_settles():
@@ -100,18 +100,52 @@ def test_plucked_string_vibrates_then_settles():
     assert not string.is_vibrating(30.0)
 
 
-def test_draw_gesture_commits_after_release():
-    gesture = DrawGesture(min_length=80.0, release_frames=2)
-    assert gesture.update([(500.0, 300.0), (100.0, 320.0)]) is None
-    assert gesture.pending == ((100.0, 320.0), (500.0, 300.0))
-    assert gesture.update([(100.0, 320.0)]) is None  # one-frame dropout tolerated
-    assert gesture.pending is not None
-    assert gesture.update([]) == ((100.0, 320.0), (500.0, 300.0))
-    assert gesture.pending is None
-    assert gesture.update([]) is None
+def test_pluck_with_displacement_starts_from_the_bent_shape():
+    strings = make_set()
+    string = strings.add((100.0, 200.0), (700.0, 200.0), DIAGONAL, now=0.0)
+    xs = np.linspace(0, 1, 101)
+    string.pluck(1.0, 0.3, 0.8, displacement=-40.0)
+    shape = string.displacement(xs, 1.0)
+    triangle = -40.0 * np.minimum(xs / 0.3, (1 - xs) / 0.7)
+    # Six modes only approximate the triangle; the kink gets rounded.
+    assert np.max(np.abs(shape - triangle)) < 6.0
+    assert shape[30] < -30.0  # bent towards the negative normal side
+    assert string.is_vibrating(1.0)
 
 
-def test_draw_gesture_ignores_short_strings():
-    gesture = DrawGesture(min_length=80.0, release_frames=1)
-    gesture.update([(100.0, 100.0), (130.0, 110.0)])
-    assert gesture.update([]) is None
+def test_envelope_profile_bounds_the_vibration_and_decays():
+    strings = make_set()
+    string = strings.add((100.0, 200.0), (700.0, 200.0), DIAGONAL, now=0.0)
+    xs = np.linspace(0, 1, 41)
+    string.pluck(1.0, 0.5, 1.0, displacement=50.0)
+    period = 1.0 / visual_frequency(string.frequency)
+    profile = string.envelope_profile(xs, 1.0)
+    over_a_period = np.array([np.abs(string.displacement(xs, 1.0 + period * k / 10)) for k in range(10)])
+    assert np.all(over_a_period <= profile + 0.5)
+    assert profile.max() > 35.0  # an "eye" as wide as the bend
+    assert profile[0] == pytest.approx(0.0, abs=1e-9)
+    assert string.envelope_profile(xs, 2.0).max() < profile.max()
+    assert string.envelope_profile(xs, 30.0).max() == 0.0
+
+
+def test_move_endpoint_retunes_the_string():
+    strings = make_set()
+    string = strings.add((100.0, 200.0), (900.0, 200.0), DIAGONAL, now=0.0)
+    low = string.midi
+    strings.move_endpoint(string, 1, (400.0, 200.0), DIAGONAL)
+    assert string.end == (400.0, 200.0) and string.start == (100.0, 200.0)
+    assert string.length == pytest.approx(300.0)
+    assert string.midi > low
+    assert string.midi == strings.note_for_length(300.0, DIAGONAL)
+    strings.move_endpoint(string, 0, (-200.0, 200.0), DIAGONAL)
+    assert string.length == pytest.approx(600.0)
+    assert string.midi == strings.note_for_length(600.0, DIAGONAL) < strings.note_for_length(300.0, DIAGONAL)
+
+
+def test_end_resize_restarts_the_grace_period():
+    strings = make_set()
+    string = strings.add((100.0, 200.0), (700.0, 200.0), DIAGONAL, now=0.0)
+    assert string.can_pluck(5.0)
+    strings.end_resize(string, 5.0)
+    assert not string.can_pluck(5.0 + COMMIT_GRACE_S / 2)
+    assert string.can_pluck(5.0 + COMMIT_GRACE_S * 1.1)

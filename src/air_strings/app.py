@@ -11,17 +11,20 @@ from pathlib import Path
 import cv2
 
 from air_strings.demo import render_demo
-from air_strings.geometry import distance
+from air_strings.gestures import DrawGesture, GestureController, GrabGesture, Pluck, PullGesture
 from air_strings.hands import DEFAULT_MODEL_PATH, HandTracker, ensure_model
+from air_strings.particles import ParticleSystem
 from air_strings.render import Renderer
 from air_strings.scales import SCALES, PitchMapping, next_scale
-from air_strings.strings import MAX_STRINGS, DrawGesture, StringSet
+from air_strings.strings import MAX_STRINGS, StringSet
 from air_strings.synth import AudioEngine, VoicePool
 
 WINDOW_NAME = "air-strings"
-# Fingertip speed, in frame diagonals per second, that counts as a full-force pluck.
-FULL_VELOCITY_DIAGONALS_PER_S = 2.0
 MAX_FAILED_READS = 30
+# Longest step the particles are advanced by, so a stalled frame does not fling them away.
+MAX_PARTICLE_DT_S = 0.1
+# Sparks are tinted halfway between white and the string's color.
+SPARK_WHITENESS = 0.55
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -43,7 +46,8 @@ class AirStringsApp:
         capture: cv2.VideoCapture,
         tracker: HandTracker,
         strings: StringSet,
-        gesture: DrawGesture,
+        gestures: GestureController,
+        particles: ParticleSystem,
         renderer: Renderer,
         audio: AudioEngine,
         max_frames: int = 0,
@@ -52,7 +56,8 @@ class AirStringsApp:
         self._capture = capture
         self._tracker = tracker
         self._strings = strings
-        self._gesture = gesture
+        self._gestures = gestures
+        self._particles = particles
         self._renderer = renderer
         self._audio = audio
         self._max_frames = max_frames
@@ -93,32 +98,37 @@ class AirStringsApp:
             self._fps = 1.0 / dt if self._fps == 0 else 0.9 * self._fps + 0.1 / dt
 
         hands = self._tracker.process(frame, now)
-
-        committed = self._gesture.update([h.pinch_point for h in hands if h.pinching])
-        if committed is not None:
-            self._strings.add(committed[0], committed[1], diagonal, now)
-
-        if dt > 0:
-            for hand in hands:
-                if hand.pinching or hand.previous_tip is None:
-                    continue
-                plucks = self._strings.find_plucks(hand.previous_tip, hand.tip, now)
-                if not plucks:
-                    continue
-                speed = distance(hand.previous_tip, hand.tip) / dt / diagonal
-                velocity = min(1.0, speed / FULL_VELOCITY_DIAGONALS_PER_S)
-                for pluck in plucks:
-                    pluck.string.pluck(now, pluck.position, velocity)
-                    self._audio.pluck(pluck.string.string_id, pluck.string.frequency, velocity, pluck.position)
+        for pluck in self._gestures.update(hands, now, dt, diagonal):
+            self._on_pluck(pluck)
+        self._particles.update(min(dt, MAX_PARTICLE_DT_S))
 
         hud = [
             f"Scale: {self._strings.scale.name}",
             f"FPS: {self._fps:4.1f}   strings: {len(self._strings.strings)}/{MAX_STRINGS}",
             "Pinch with both hands, pull apart, release: new string",
-            "Flick your index finger across a string to pluck",
+            "Pinch one end of a string with one hand and drag: resize",
+            "Push your index finger through a string until it slips: pluck",
             "c: clear   s: scale   q/Esc: quit",
         ]
-        self._renderer.draw_frame(frame, hands, self._strings.strings, self._gesture.pending, now, hud)
+        self._renderer.draw_frame(
+            frame,
+            hands,
+            self._strings.strings,
+            self._gestures.view(),
+            self._particles,
+            self._strings.scale,
+            now,
+            hud,
+        )
+
+    def _on_pluck(self, pluck: Pluck) -> None:
+        string = pluck.string
+        self._audio.pluck(string.string_id, string.frequency, pluck.velocity, pluck.position)
+        length = max(string.length, 1e-9)
+        tangent = ((string.end[0] - string.start[0]) / length, (string.end[1] - string.start[1]) / length)
+        normal = (-tangent[1], tangent[0])
+        tint = tuple(SPARK_WHITENESS * 255.0 + (1.0 - SPARK_WHITENESS) * c for c in string.color)
+        self._particles.emit(pluck.origin, tangent, normal, pluck.velocity, tint)
 
     def _handle_key(self, key: int) -> bool:
         """Returns False when the app should quit."""
@@ -126,6 +136,7 @@ class AirStringsApp:
             return False
         if key == ord("c"):
             self._strings.clear()
+            self._particles.clear()
         elif key == ord("s"):
             self._strings.set_scale(next_scale(self._strings.scale))
         return True
@@ -152,12 +163,15 @@ def main(argv: list[str] | None = None) -> int:
 
     tracker = HandTracker(model_path)
     audio = AudioEngine(VoicePool())
+    mapping = PitchMapping()
+    strings = StringSet(mapping, SCALES[0])
     app = AirStringsApp(
         capture=capture,
         tracker=tracker,
-        strings=StringSet(PitchMapping(), SCALES[0]),
-        gesture=DrawGesture(),
-        renderer=Renderer(),
+        strings=strings,
+        gestures=GestureController(strings, DrawGesture(), GrabGesture(), PullGesture()),
+        particles=ParticleSystem(),
+        renderer=Renderer(mapping),
         audio=audio,
         max_frames=args.frames,
         headless=args.headless,

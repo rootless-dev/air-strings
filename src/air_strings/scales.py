@@ -66,6 +66,14 @@ class PitchMapping:
         semitones = min(float(self.span), max(0.0, semitones))
         return self.lowest_midi + semitones
 
+    def length_fraction(self, midi: float) -> float:
+        """Inverse of `continuous_midi`: the string length (fraction of the diagonal) playing `midi`.
+
+        Pitches outside the mapped range are clamped to it, like the forward mapping.
+        """
+        semitones = min(float(self.span), max(0.0, midi - self.lowest_midi))
+        return self.longest_fraction * 2.0 ** (-semitones / 12.0)
+
     def quantize(self, continuous: float, scale: Scale) -> int:
         """Nearest note of `scale` within the mapped range (ties go to the lower note)."""
         candidates = scale.notes(self.lowest_midi, self.span)

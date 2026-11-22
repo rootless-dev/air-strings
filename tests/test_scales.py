@@ -38,6 +38,30 @@ def test_length_maps_to_pitch_like_a_real_string():
     assert mapping.continuous_midi(0.15) == pytest.approx(72.0)
 
 
+def test_length_fraction_inverts_the_pitch_mapping():
+    mapping = PitchMapping()
+    assert mapping.length_fraction(48) == pytest.approx(0.65)
+    assert mapping.length_fraction(60) == pytest.approx(0.325)
+    assert mapping.length_fraction(72) == pytest.approx(0.1625)
+    for midi in np.linspace(48.0, 72.0, 49):
+        assert mapping.continuous_midi(mapping.length_fraction(midi)) == pytest.approx(midi)
+    for fraction in np.linspace(0.17, 0.64, 30):
+        assert mapping.length_fraction(mapping.continuous_midi(fraction)) == pytest.approx(fraction)
+
+
+def test_length_fraction_clamps_like_the_forward_mapping():
+    mapping = PitchMapping()
+    assert mapping.length_fraction(30) == mapping.length_fraction(48)
+    assert mapping.length_fraction(90) == mapping.length_fraction(72)
+
+
+@pytest.mark.parametrize("scale", SCALES, ids=lambda s: s.name)
+def test_every_scale_note_round_trips_through_its_length(scale):
+    mapping = PitchMapping()
+    for midi in scale.notes():
+        assert mapping.note_for_length(mapping.length_fraction(midi), scale) == midi
+
+
 def test_note_names():
     assert note_name(60) == "C4"
     assert note_name(64) == "E4"
