@@ -1,0 +1,30 @@
+[project]
+name = "air-strings"
+version = "0.1.0"
+description = "A computer-vision air instrument: draw guitar strings in the air and pluck them"
+readme = "README.md"
+authors = [
+    { name = "Carlos Eduardo", email = "71237690+carlosealves2@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mediapipe>=1.2.3",
+    "numpy>=2.5.5",
+    "opencv-contrib-python>=5.1.0.95",
+    "sounddevice>=0.5.6",
+]
+
+[project.scripts]
+air-strings = "air_strings.app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
