@@ -59,10 +59,11 @@ uv run python scripts/bench_render.py  # frame drawing time in a busy 1280x720 s
 ```
 
 Layout (`src/air_strings/`): `hands.py` (MediaPipe HandLandmarker, One-Euro
-smoothing, pinch detection), `geometry.py` (segment crossing), `scales.py`
+smoothing, pinch detection), `pipeline.py` (camera capture and hand
+detection on a background thread, newest result wins), `geometry.py` (segment crossing), `scales.py`
 (scales, length to note), `ruler.py` (ruler geometry), `strings.py` (string
 model, vibration), `string_fx.py` (the string's look: ghost strands, wobble,
 pulled curve, color gradient), `gestures.py` (draw, grab and pull state
 machines), `particles.py` (spark particles), `synth.py` (Karplus-Strong
 voices, voice pool, audio stream), `render.py` (OpenCV drawing), `app.py`
-(composition and main loop).
+(composition and the main-thread loop: gestures, drawing, window).
