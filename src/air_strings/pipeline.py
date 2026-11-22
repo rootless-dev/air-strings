@@ -3,12 +3,16 @@
 The worker reads a frame, mirrors it, runs the hand tracker on it and publishes
 the bundle to a single-slot mailbox. A new bundle overwrites one the main thread
 has not taken yet, so the display always gets the freshest frame and never
-falls behind a queue of stale ones. OpenCV and MediaPipe release the GIL in
-their native calls, so capture and detection run in parallel with rendering.
+falls behind a queue of stale ones. The overwritten bundle's hands are kept,
+though: gestures need every detection, because each hand's previous fingertip
+is the one from the tracker's previous detection, displayed or not. OpenCV and
+MediaPipe release the GIL in their native calls, so capture and detection run
+in parallel with rendering.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import threading
 import time
@@ -25,6 +29,9 @@ from air_strings.hands import Hand
 MAX_FAILED_READS = 30
 # How long stop() waits for the worker to finish its current read and detection.
 STOP_TIMEOUT_S = 2.0
+# Most skipped detections whose hands are kept for the gestures (half a second at
+# 30 fps); after a longer stall the oldest are dropped, rather than replaying stale plucks.
+MAX_SKIPPED = 15
 
 
 class FrameSource(Protocol):
@@ -40,24 +47,44 @@ class CameraStoppedError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class HandSample:
+    """The hands of a detection whose frame was never displayed."""
+
+    hands: list[Hand]
+    timestamp: float
+    dt: float
+
+
+@dataclass(frozen=True)
 class Detection:
     frame: np.ndarray  # mirrored BGR frame, owned by the consumer once taken
     hands: list[Hand]  # hands detected on this very frame
     timestamp: float  # monotonic capture time, in seconds
     dt: float  # time since the previous detection (0 for the first one)
     sequence: int  # 1 for the first detection, then +1 per detection
+    # Hands of the detections this one overwrote before they were taken, oldest first.
+    skipped: tuple[HandSample, ...] = ()
 
 
 class LatestDetection:
-    """Single-slot mailbox: publishing replaces any detection not taken yet."""
+    """Single-slot mailbox: publishing replaces any detection not taken yet.
 
-    def __init__(self) -> None:
+    The replaced detection's frame is dropped, but its hands are carried over
+    in the new detection's `skipped` (up to `max_skipped` of them).
+    """
+
+    def __init__(self, max_skipped: int = MAX_SKIPPED) -> None:
         self._condition = threading.Condition()
         self._item: Detection | None = None
         self._closed = False
+        self._max_skipped = max_skipped
 
     def publish(self, item: Detection) -> None:
         with self._condition:
+            old = self._item
+            if old is not None:
+                skipped = (*old.skipped, HandSample(old.hands, old.timestamp, old.dt))
+                item = dataclasses.replace(item, skipped=skipped[max(0, len(skipped) - self._max_skipped) :])
             self._item = item
             self._condition.notify_all()
 

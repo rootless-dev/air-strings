@@ -112,8 +112,8 @@ class RecordingRenderer(Renderer):
         self._on_draw()
 
 
-def build_app(capture, tracker, frames, headless=True, renderer=None, clock=time.monotonic):
-    worker = DetectionWorker(capture, tracker, LatestDetection(), clock=clock)
+def build_app(capture, tracker, frames, headless=True, renderer=None, clock=time.monotonic, mailbox=None):
+    worker = DetectionWorker(capture, tracker, mailbox or LatestDetection(), clock=clock)
     mapping = PitchMapping()
     strings = StringSet(mapping, SCALES[0])
     audio = RecordingAudio()
@@ -158,6 +158,63 @@ def test_draw_commit_and_swipe_reach_the_audio_engine():
     [(string_id, frequency, velocity, position)] = audio.plucks
     assert string_id == string.string_id
     assert frequency == string.frequency
+    assert 0.0 < velocity <= 1.0
+    assert abs(position - 300.0 / 700.0) < 1e-9
+
+
+class CountingMailbox(LatestDetection):
+    """Counts publishes, so a test can wait until the worker has overwritten a detection."""
+
+    def __init__(self):
+        super().__init__()
+        self._published = 0
+        self._counted = threading.Condition()
+
+    def publish(self, item):
+        super().publish(item)
+        with self._counted:
+            self._published += 1
+            self._counted.notify_all()
+
+    def wait_published(self, count, timeout=2.0):
+        with self._counted:
+            return self._counted.wait_for(lambda: self._published >= count, timeout)
+
+
+def test_swipe_in_a_detection_the_display_skipped_still_plucks():
+    script = draw_string_script((300.0, 360.0), (1000.0, 360.0))
+    script += [[(0, (600.0, 300.0), False)] for _ in range(15)]  # frames 10-24: open hand rests
+    script += [[(0, (600.0, 460.0), False)]]  # frame 25: the swipe through the string, never displayed
+    capture = LockstepCapture()
+    mailbox = CountingMailbox()
+    draws = 0
+
+    def on_draw():
+        nonlocal draws
+        draws += 1
+        if draws == 25:
+            # While frame 24 is on screen, let frames 25 and 26 through: 26 overwrites 25.
+            capture.advance()
+            capture.advance()
+            assert mailbox.wait_published(27)
+        else:
+            capture.advance()
+
+    ticks = iter(np.arange(0.0, 20.0, 1 / 30))
+    app, _, strings, audio, _, _ = build_app(
+        capture,
+        ScriptedTracker(script),
+        frames=40,
+        renderer=RecordingRenderer(on_draw=on_draw),
+        clock=lambda: float(next(ticks)),
+        mailbox=mailbox,
+    )
+
+    assert app.run() == 0
+    assert capture.reads > app.frames_processed  # a detection really was skipped
+    [string] = strings.strings
+    [(string_id, _, velocity, position)] = audio.plucks
+    assert string_id == string.string_id
     assert 0.0 < velocity <= 1.0
     assert abs(position - 300.0 / 700.0) < 1e-9
 

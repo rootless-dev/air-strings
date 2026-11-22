@@ -19,6 +19,19 @@ def test_latest_detection_wins_over_older_ones():
     assert mailbox.take(timeout=0) is None  # older ones were dropped, not queued
 
 
+def test_overwritten_detections_keep_their_hands_oldest_first_up_to_the_limit():
+    mailbox = LatestDetection(max_skipped=2)
+    for sequence in (1, 2, 3, 4):
+        mailbox.publish(detection(sequence))
+
+    latest = mailbox.take(timeout=0)
+    assert latest.sequence == 4
+    assert [sample.timestamp for sample in latest.skipped] == [2.0, 3.0]  # 1 fell past the limit
+
+    mailbox.publish(detection(5))
+    assert mailbox.take(timeout=0).skipped == ()  # nothing was overwritten since the last take
+
+
 def test_take_waits_for_a_publish_from_another_thread():
     mailbox = LatestDetection()
     publisher = threading.Timer(0.02, mailbox.publish, args=(detection(7),))

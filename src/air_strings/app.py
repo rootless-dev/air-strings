@@ -127,8 +127,12 @@ class AirStringsApp:
         self._last_timestamp = now
         self._update_rates(detection.sequence)
 
-        for pluck in self._gestures.update(hands, now, detection.dt, diagonal):
-            self._on_pluck(pluck)
+        # Detections the display skipped still go through the gestures, in order: each
+        # hand's previous fingertip is from the detection before it, so a swipe that
+        # crossed a string in a skipped one would otherwise never be seen.
+        for sample in (*detection.skipped, detection):
+            for pluck in self._gestures.update(sample.hands, sample.timestamp, sample.dt, diagonal):
+                self._on_pluck(pluck)
         self._particles.update(min(dt, MAX_PARTICLE_DT_S))
 
         hud = [
