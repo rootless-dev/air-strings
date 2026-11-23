@@ -1,6 +1,8 @@
 """End-to-end runs of the main loop with a scripted camera, tracker and audio engine."""
 
 import math
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -9,6 +11,7 @@ from air_strings.app import AirStringsApp
 from air_strings.gestures import PULL_THRESHOLD_VELOCITY, DrawGesture, GestureController, GrabGesture, PullGesture
 from air_strings.hands import INDEX_TIP, THUMB_TIP, Hand
 from air_strings.particles import ParticleSystem
+from air_strings.pipeline import DetectionWorker, LatestDetection
 from air_strings.render import Renderer
 from air_strings.scales import SCALES, PitchMapping, midi_to_frequency
 from air_strings.strings import StringSet
@@ -16,9 +19,48 @@ from air_strings.strings import StringSet
 DIAGONAL = math.hypot(1280, 720)
 
 
-class FakeCapture:
+def blank_frame():
+    return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+
+class LockstepCapture:
+    """Hands out one frame per drawn frame, so no scripted frame is skipped by "latest wins".
+
+    `advance` (called after each draw) lets the next read through. A read that waits
+    too long reports a failed read, so the worker still notices the stop signal.
+    """
+
+    def __init__(self):
+        self._turn = threading.Semaphore(1)
+        self.reads = 0
+
+    def advance(self):
+        self._turn.release()
+
     def read(self):
-        return True, np.zeros((720, 1280, 3), dtype=np.uint8)
+        if not self._turn.acquire(timeout=0.05):
+            return False, None
+        self.reads += 1
+        return True, blank_frame()
+
+
+class FreeRunningCapture:
+    def read(self):
+        return True, blank_frame()
+
+
+class DeadCapture:
+    def read(self):
+        return False, None
+
+
+class FailingTracker:
+    def process(self, frame, now):
+        raise ValueError("model crashed")
+
+
+def detection_threads():
+    return [t for t in threading.enumerate() if t.name == "air-strings-detection"]
 
 
 def hand(hand_id, tip, pinching, previous_tip=None):
@@ -59,42 +101,55 @@ class RecordingAudio:
 
 
 class RecordingRenderer(Renderer):
-    def __init__(self):
+    def __init__(self, on_draw=lambda: None):
         super().__init__()
         self.views = []
+        self._on_draw = on_draw
 
     def draw_frame(self, frame, hands, strings, gestures, particles, now, hud_lines):
         self.views.append(gestures)
         super().draw_frame(frame, hands, strings, gestures, particles, now, hud_lines)
+        self._on_draw()
 
 
-def make_app(monkeypatch, script, frames):
-    clock = iter(np.arange(0.0, 20.0, 1 / 30))
-    monkeypatch.setattr("air_strings.app.time.monotonic", lambda: float(next(clock)))
+def build_app(capture, tracker, frames, headless=True, renderer=None, clock=time.monotonic, mailbox=None):
+    worker = DetectionWorker(capture, tracker, mailbox or LatestDetection(), clock=clock)
     mapping = PitchMapping()
     strings = StringSet(mapping, SCALES[0])
     audio = RecordingAudio()
     particles = ParticleSystem(rng=np.random.default_rng(0))
-    renderer = RecordingRenderer()
+    renderer = renderer or RecordingRenderer()
     app = AirStringsApp(
-        capture=FakeCapture(),
-        tracker=ScriptedTracker(script),
+        worker=worker,
         strings=strings,
         gestures=GestureController(strings, DrawGesture(), GrabGesture(), PullGesture()),
         particles=particles,
         renderer=renderer,
         audio=audio,
         max_frames=frames,
-        headless=True,
+        headless=headless,
+    )
+    return app, worker, strings, audio, particles, renderer
+
+
+def make_app(script, frames):
+    capture = LockstepCapture()
+    ticks = iter(np.arange(0.0, 20.0, 1 / 30))  # one 30 fps tick per captured frame
+    app, _, strings, audio, particles, renderer = build_app(
+        capture,
+        ScriptedTracker(script),
+        frames,
+        renderer=RecordingRenderer(on_draw=capture.advance),
+        clock=lambda: float(next(ticks)),
     )
     return app, strings, audio, particles, renderer
 
 
-def test_draw_commit_and_swipe_reach_the_audio_engine(monkeypatch):
+def test_draw_commit_and_swipe_reach_the_audio_engine():
     script = draw_string_script((300.0, 360.0), (1000.0, 360.0))
     script += [[(0, (600.0, 300.0), False)] for _ in range(15)]  # frames 10-24: open hand rests
     script += [[(0, (600.0, 460.0), False)]]  # frame 25: one fast swipe down through the string
-    app, strings, audio, particles, _ = make_app(monkeypatch, script, frames=40)
+    app, strings, audio, particles, _ = make_app(script, frames=40)
 
     assert app.run() == 0
     assert app.frames_processed == 40
@@ -107,7 +162,64 @@ def test_draw_commit_and_swipe_reach_the_audio_engine(monkeypatch):
     assert abs(position - 300.0 / 700.0) < 1e-9
 
 
-def test_grab_resize_then_pull_and_release(monkeypatch):
+class CountingMailbox(LatestDetection):
+    """Counts publishes, so a test can wait until the worker has overwritten a detection."""
+
+    def __init__(self):
+        super().__init__()
+        self._published = 0
+        self._counted = threading.Condition()
+
+    def publish(self, item):
+        super().publish(item)
+        with self._counted:
+            self._published += 1
+            self._counted.notify_all()
+
+    def wait_published(self, count, timeout=2.0):
+        with self._counted:
+            return self._counted.wait_for(lambda: self._published >= count, timeout)
+
+
+def test_swipe_in_a_detection_the_display_skipped_still_plucks():
+    script = draw_string_script((300.0, 360.0), (1000.0, 360.0))
+    script += [[(0, (600.0, 300.0), False)] for _ in range(15)]  # frames 10-24: open hand rests
+    script += [[(0, (600.0, 460.0), False)]]  # frame 25: the swipe through the string, never displayed
+    capture = LockstepCapture()
+    mailbox = CountingMailbox()
+    draws = 0
+
+    def on_draw():
+        nonlocal draws
+        draws += 1
+        if draws == 25:
+            # While frame 24 is on screen, let frames 25 and 26 through: 26 overwrites 25.
+            capture.advance()
+            capture.advance()
+            assert mailbox.wait_published(27)
+        else:
+            capture.advance()
+
+    ticks = iter(np.arange(0.0, 20.0, 1 / 30))
+    app, _, strings, audio, _, _ = build_app(
+        capture,
+        ScriptedTracker(script),
+        frames=40,
+        renderer=RecordingRenderer(on_draw=on_draw),
+        clock=lambda: float(next(ticks)),
+        mailbox=mailbox,
+    )
+
+    assert app.run() == 0
+    assert capture.reads > app.frames_processed  # a detection really was skipped
+    [string] = strings.strings
+    [(string_id, _, velocity, position)] = audio.plucks
+    assert string_id == string.string_id
+    assert 0.0 < velocity <= 1.0
+    assert abs(position - 300.0 / 700.0) < 1e-9
+
+
+def test_grab_resize_then_pull_and_release():
     script = draw_string_script((300.0, 360.0), (1000.0, 360.0))
     script += [[(0, (600.0, 200.0), False)] for _ in range(10)]  # frames 10-19: commit, rest
     # Frames 20-29: one hand pinches the right end and drags it to x = 800.
@@ -116,7 +228,7 @@ def test_grab_resize_then_pull_and_release(monkeypatch):
     # Frames 45-50: the open fingertip pushes down through the string (500 px: threshold 50 px).
     script += [[(0, (500.0, y), False)] for y in (340.0, 355.0, 370.0, 385.0, 400.0, 415.0)]
     script += [[(0, (500.0, 415.0), False)]]
-    app, strings, audio, particles, renderer = make_app(monkeypatch, script, frames=60)
+    app, strings, audio, particles, renderer = make_app(script, frames=60)
 
     assert app.run() == 0
     [string] = strings.strings
@@ -140,7 +252,7 @@ def test_grab_resize_then_pull_and_release(monkeypatch):
     assert particles.count > 0
 
 
-def test_other_hand_plucks_while_resizing_at_the_current_note(monkeypatch):
+def test_other_hand_plucks_while_resizing_at_the_current_note():
     script = draw_string_script((300.0, 360.0), (1000.0, 360.0))  # 700 px
     script += [[(0, (600.0, 200.0), False)] for _ in range(10)]  # frames 10-19: commit, rest
     # Frames 20-29: hand 0 pinches the right end and drags it to x = 800 (500 px); hand 1 rests above.
@@ -151,7 +263,7 @@ def test_other_hand_plucks_while_resizing_at_the_current_note(monkeypatch):
     script += [[(0, (650.0, 360.0), True), (1, (500.0, 460.0), False)] for _ in range(4)]
     script += [[(0, (650.0, 360.0), True), (1, (500.0, 260.0), False)]]  # frame 40: hand 1 swipes back up
     script += [[(1, (500.0, 260.0), False)]]  # frames 41+: hand 0 lets go
-    app, strings, audio, particles, renderer = make_app(monkeypatch, script, frames=46)
+    app, strings, audio, particles, renderer = make_app(script, frames=46)
 
     assert app.run() == 0
     [string] = strings.strings
@@ -171,3 +283,98 @@ def test_other_hand_plucks_while_resizing_at_the_current_note(monkeypatch):
     assert renderer.views[40].stretches[0].midi == second_note
     assert all(not v.stretches for v in renderer.views[43:])
     assert particles.count > 0
+
+
+class NoHands:
+    def process(self, frame, now):
+        return []
+
+
+def fake_window(monkeypatch, key, visible):
+    shown = []
+    monkeypatch.setattr("air_strings.app.cv2.imshow", lambda name, frame: shown.append(frame))
+    monkeypatch.setattr("air_strings.app.cv2.waitKey", lambda delay: key)
+    monkeypatch.setattr("air_strings.app.cv2.getWindowProperty", lambda name, prop: visible)
+    return shown
+
+
+@pytest.mark.parametrize("key", [ord("q"), 27])
+def test_quit_key_stops_and_joins_the_worker(monkeypatch, key):
+    shown = fake_window(monkeypatch, key, visible=1.0)
+    app, worker, *_ = build_app(FreeRunningCapture(), NoHands(), frames=0, headless=False)
+
+    assert app.run() == 0
+    assert app.frames_processed == 1 and len(shown) == 1
+    assert not worker.alive
+    assert detection_threads() == []
+
+
+def test_closing_the_window_stops_and_joins_the_worker(monkeypatch):
+    fake_window(monkeypatch, -1, visible=0.0)
+    app, worker, *_ = build_app(FreeRunningCapture(), NoHands(), frames=0, headless=False)
+
+    assert app.run() == 0
+    assert app.frames_processed == 1
+    assert not worker.alive
+    assert detection_threads() == []
+
+
+def test_camera_failure_in_the_worker_ends_the_run_with_exit_code_1(capsys):
+    app, worker, *_ = build_app(DeadCapture(), NoHands(), frames=0)
+
+    assert app.run() == 1
+    assert "camera stopped delivering frames" in capsys.readouterr().err
+    assert app.frames_processed == 0
+    assert not worker.alive
+    assert detection_threads() == []
+
+
+def test_tracker_error_in_the_worker_surfaces_on_the_main_thread():
+    app, worker, *_ = build_app(FreeRunningCapture(), FailingTracker(), frames=0)
+
+    with pytest.raises(ValueError, match="model crashed"):
+        app.run()
+    assert not worker.alive
+    assert detection_threads() == []
+
+
+def test_slow_display_skips_to_the_latest_detection():
+    """When drawing is slower than detection, stale detections are dropped, not queued."""
+    class SlowRenderer(Renderer):
+        def __init__(self):
+            super().__init__()
+            self.drawn_at = []
+
+        def draw_frame(self, frame, hands, strings, gestures, particles, now, hud_lines):
+            self.drawn_at.append(now)
+            time.sleep(0.03)
+
+    class CountingTracker:
+        def __init__(self):
+            self.calls = 0
+
+        def process(self, frame, now):
+            self.calls += 1
+            return []
+
+    tracker = CountingTracker()
+    renderer = SlowRenderer()
+    app, worker, *_ = build_app(FreeRunningCapture(), tracker, frames=8, renderer=renderer)
+
+    started = time.monotonic()
+    assert app.run() == 0
+    elapsed = time.monotonic() - started
+    assert len(renderer.drawn_at) == 8
+    assert renderer.drawn_at == sorted(renderer.drawn_at)
+    assert tracker.calls > 2 * len(renderer.drawn_at)  # most detections were never displayed
+    # Each displayed frame is the newest one: no backlog of stale frames is drained.
+    assert renderer.drawn_at[-1] >= started + 0.03 * 6
+    assert elapsed < 1.0
+    assert not worker.alive
+
+
+def test_bounded_run_prints_a_rate_summary(capsys):
+    app, *_ = build_app(FreeRunningCapture(), NoHands(), frames=5)
+
+    assert app.run() == 0
+    assert "air-strings: frames 5 in" in capsys.readouterr().err
