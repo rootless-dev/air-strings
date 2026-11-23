@@ -1,35 +1,31 @@
-"""Application composition, main loop and lifecycle."""
+"""Application composition and lifecycle, and the headless loop."""
 
 from __future__ import annotations
 
 import argparse
-import math
 import sys
-import time
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
 
+from air_strings.camera import CameraSession
 from air_strings.demo import render_demo
-from air_strings.gestures import DrawGesture, GestureController, GrabGesture, Pluck, PullGesture
+from air_strings.engine import Engine
+from air_strings.gestures import DrawGesture, GestureController, GrabGesture, PullGesture
 from air_strings.hands import DEFAULT_MODEL_PATH, HandTracker, ensure_model
 from air_strings.particles import ParticleSystem
-from air_strings.pipeline import CameraStoppedError, Detection, DetectionWorker, LatestDetection
+from air_strings.pipeline import CameraStoppedError
 from air_strings.render import Renderer
-from air_strings.scales import SCALES, PitchMapping, next_scale
-from air_strings.strings import MAX_STRINGS, StringSet
+from air_strings.scales import SCALES, PitchMapping
+from air_strings.strings import StringSet
 from air_strings.synth import AudioEngine, VoicePool
 
-WINDOW_NAME = "air-strings"
-# Longest wait for a new detection before pumping the window events anyway, so keys
-# and window closing still work when the camera is slow or stalls.
+# Longest wait of the headless loop for a new detection, so it notices a closed mailbox.
 DETECTION_WAIT_S = 0.05
-# Weight of the newest sample in the smoothed HUD rates.
-RATE_SMOOTHING = 0.1
-# Longest step the particles are advanced by, so a stalled frame does not fling them away.
-MAX_PARTICLE_DT_S = 0.1
-# Sparks are pale: mostly white, slightly tinted with the string's color.
-SPARK_WHITENESS = 0.8
+
+# Runs the user interface until it is closed: (engine, camera session, max frames).
+UserInterface = Callable[[Engine, CameraSession, int], None]
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -46,69 +42,53 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 class AirStringsApp:
-    """Main thread: gestures, drawing and the window. Capture and detection run in `worker`."""
+    """Starts the camera session, runs the UI (or the headless loop) and shuts everything down.
+
+    With `ui` None the app runs headless: no window, frames are stepped and dropped.
+    `max_frames` > 0 ends the run after that many displayed frames.
+    """
 
     def __init__(
         self,
-        worker: DetectionWorker,
-        strings: StringSet,
-        gestures: GestureController,
-        particles: ParticleSystem,
-        renderer: Renderer,
-        audio: AudioEngine,
+        session: CameraSession,
+        engine: Engine,
         max_frames: int = 0,
-        headless: bool = False,
+        ui: UserInterface | None = None,
     ) -> None:
-        self._worker = worker
-        self._strings = strings
-        self._gestures = gestures
-        self._particles = particles
-        self._renderer = renderer
-        self._audio = audio
+        self._session = session
+        self._engine = engine
         self._max_frames = max_frames
-        self._headless = headless
-        self._window_shown = False
-        self._last_timestamp: float | None = None
-        # Displayed-frame and detection rates, measured on the main thread's wall clock.
-        self._fps = 0.0
-        self._detection_fps = 0.0
-        self._last_display_at: float | None = None
-        self._last_sequence = 0
-        self._first_display: tuple[float, int] | None = None  # (wall time, sequence)
-        self.frames_processed = 0
+        self._ui = ui
+
+    @property
+    def frames_processed(self) -> int:
+        return self._engine.frames
 
     def run(self) -> int:
-        self._worker.start()
+        self._session.start()
         try:
-            status = self._loop()
+            if self._ui is None:
+                self._run_headless()
+            else:
+                self._ui(self._engine, self._session, self._max_frames)
         finally:
-            self._worker.stop()
+            self._session.stop()
         if self._max_frames > 0:
-            self._print_summary()
-        return status
+            print(self._engine.meter.summary(), file=sys.stderr)
+        return self._exit_status()
 
-    def _loop(self) -> int:
-        mailbox = self._worker.mailbox
-        while self._max_frames <= 0 or self.frames_processed < self._max_frames:
+    def _run_headless(self) -> None:
+        while self._max_frames <= 0 or self._engine.frames < self._max_frames:
+            mailbox = self._session.mailbox
             detection = mailbox.take(DETECTION_WAIT_S)
             if detection is not None:
-                self._step(detection)
-                self.frames_processed += 1
+                self._engine.step(detection)
             elif mailbox.closed:
-                return self._worker_ended()
-            if not self._headless:
-                if detection is not None:
-                    cv2.imshow(WINDOW_NAME, detection.frame)
-                    self._window_shown = True
-                if not self._handle_key(cv2.waitKey(1) & 0xFF):
-                    break
-                if self._window_shown and cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-        return 0
+                return
 
-    def _worker_ended(self) -> int:
-        """The detection thread ended on its own: report why."""
-        error = self._worker.error
+    def _exit_status(self) -> int:
+        """0, or why the detection thread ended on its own: 1 for a lost camera, else its exception."""
+        error = self._session.worker.error
         if isinstance(error, CameraStoppedError):
             print("air-strings: camera stopped delivering frames", file=sys.stderr)
             return 1
@@ -116,95 +96,16 @@ class AirStringsApp:
             raise error
         return 0
 
-    def _step(self, detection: Detection) -> None:
-        """Update strings and plucks from the detected hands, and draw onto the frame in place."""
-        frame, hands, now = detection.frame, detection.hands, detection.timestamp
-        height, width = frame.shape[:2]
-        diagonal = math.hypot(width, height)
-        # Time since the last displayed frame; it differs from `detection.dt` (time since the
-        # previous detection, which the fingertip speed is measured over) when one was skipped.
-        dt = now - self._last_timestamp if self._last_timestamp is not None else 0.0
-        self._last_timestamp = now
-        self._update_rates(detection.sequence)
 
-        # Detections the display skipped still go through the gestures, in order: each
-        # hand's previous fingertip is from the detection before it, so a swipe that
-        # crossed a string in a skipped one would otherwise never be seen.
-        for sample in (*detection.skipped, detection):
-            for pluck in self._gestures.update(sample.hands, sample.timestamp, sample.dt, diagonal):
-                self._on_pluck(pluck)
-        self._particles.update(min(dt, MAX_PARTICLE_DT_S))
-
-        hud = [
-            f"Scale: {self._strings.scale.name}",
-            f"FPS: {self._fps:4.1f} | det {self._detection_fps:4.1f}   "
-            f"strings: {len(self._strings.strings)}/{MAX_STRINGS}",
-            "Pinch with both hands, pull apart, release: new string",
-            "Pinch one end of a string with one hand and drag: resize",
-            "Push your index finger through a string until it slips: pluck",
-            "c: clear   s: scale   q/Esc: quit",
-        ]
-        self._renderer.draw_frame(
-            frame,
-            hands,
-            self._strings.strings,
-            self._gestures.view(),
-            self._particles,
-            now,
-            hud,
-        )
-
-    def _update_rates(self, sequence: int) -> None:
-        now = time.perf_counter()
-        if self._first_display is None:
-            self._first_display = (now, sequence)
-        if self._last_display_at is not None:
-            elapsed = now - self._last_display_at
-            if elapsed > 0:
-                fps = 1.0 / elapsed
-                detection_fps = (sequence - self._last_sequence) / elapsed
-                if self._fps == 0:
-                    self._fps, self._detection_fps = fps, detection_fps
-                else:
-                    self._fps += RATE_SMOOTHING * (fps - self._fps)
-                    self._detection_fps += RATE_SMOOTHING * (detection_fps - self._detection_fps)
-        self._last_display_at = now
-        self._last_sequence = sequence
-
-    def _print_summary(self) -> None:
-        """End-of-run rates for bounded runs (`--frames`), measured from the first displayed frame."""
-        if self._first_display is None or self._last_display_at is None:
-            print("air-strings: no frames displayed", file=sys.stderr)
-            return
-        start, first_sequence = self._first_display
-        elapsed = self._last_display_at - start
-        frames = self.frames_processed - 1
-        detections = self._last_sequence - first_sequence
-        if elapsed <= 0:
-            print(f"air-strings: frames {self.frames_processed}", file=sys.stderr)
-            return
-        print(
-            f"air-strings: frames {self.frames_processed} in {elapsed:.2f} s = {frames / elapsed:.1f} fps, "
-            f"detections {detections / elapsed:.1f} fps",
-            file=sys.stderr,
-        )
-
-    def _on_pluck(self, pluck: Pluck) -> None:
-        string = pluck.string
-        self._audio.pluck(string.string_id, string.frequency, pluck.velocity, pluck.position)
-        tint = tuple(SPARK_WHITENESS * 255.0 + (1.0 - SPARK_WHITENESS) * c for c in string.color)
-        self._particles.emit(string.start, string.end, pluck.position, pluck.velocity, tint, pluck.displacement)
-
-    def _handle_key(self, key: int) -> bool:
-        """Returns False when the app should quit."""
-        if key in (ord("q"), 27):
-            return False
-        if key == ord("c"):
-            self._strings.clear()
-            self._particles.clear()
-        elif key == ord("s"):
-            self._strings.set_scale(next_scale(self._strings.scale))
-        return True
+def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture | None:
+    """Camera `index` at the requested size, or None if it cannot be opened."""
+    capture = cv2.VideoCapture(index)
+    if not capture.isOpened():
+        capture.release()
+        return None
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return capture
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -215,32 +116,35 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     model_path = ensure_model(args.model)
-    capture = cv2.VideoCapture(args.camera)
-    if not capture.isOpened():
+
+    def capture_factory(index: int) -> cv2.VideoCapture | None:
+        return open_camera(index, args.width, args.height)
+
+    capture = capture_factory(args.camera)
+    if capture is None:
         print(
             f"air-strings: cannot open camera {args.camera} "
             "(on macOS, allow camera access for your terminal app)",
             file=sys.stderr,
         )
         return 1
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
-    tracker = HandTracker(model_path)
-    worker = DetectionWorker(capture, tracker, LatestDetection())
+    session = CameraSession(args.camera, capture, capture_factory, lambda: HandTracker(model_path))
     audio = AudioEngine(VoicePool())
-    mapping = PitchMapping()
-    strings = StringSet(mapping, SCALES[0])
-    app = AirStringsApp(
-        worker=worker,
+    strings = StringSet(PitchMapping(), SCALES[0])
+    engine = Engine(
         strings=strings,
         gestures=GestureController(strings, DrawGesture(), GrabGesture(), PullGesture()),
         particles=ParticleSystem(),
         renderer=Renderer(),
         audio=audio,
-        max_frames=args.frames,
-        headless=args.headless,
     )
+    ui: UserInterface | None = None
+    if not args.headless:
+        from air_strings.ui.main_window import run_window  # Qt is only loaded with a window
+
+        ui = run_window
+    app = AirStringsApp(session, engine, max_frames=args.frames, ui=ui)
     audio.start()
     try:
         return app.run()
@@ -248,11 +152,3 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         audio.stop()
-        # `run` has joined the worker; if it is somehow still mid-read, leave the camera and
-        # the tracker to it rather than freeing them under its feet.
-        if not worker.alive:
-            tracker.close()
-            capture.release()
-        if not args.headless:
-            cv2.destroyAllWindows()
-            cv2.waitKey(1)

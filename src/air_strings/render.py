@@ -1,9 +1,10 @@
-"""All OpenCV drawing: hands, strings, rulers, spark particles and the HUD.
+"""All OpenCV drawing on the camera frame: hands, strings, rulers and spark particles.
 
 Strings (as glowing ghost strands), their glow, rulers, endpoint marks and sparks
 are drawn into one additive layer, which is then added onto the camera frame so
-they read as light. The pending string, note labels, hands and the HUD are drawn
-opaque on top. The shapes come from string_fx.py and ruler.py.
+they read as light. The pending string, note labels and hands are drawn opaque
+on top. The shapes come from string_fx.py and ruler.py. Status and metrics are
+not drawn here: the window shows them around the video.
 """
 
 from __future__ import annotations
@@ -144,7 +145,6 @@ class Renderer:
         gestures: GestureView,
         particles: ParticleSystem,
         now: float,
-        hud_lines: list[str],
     ) -> None:
         layer, glow = self._clear_layers(frame.shape)
         box = _Box()
@@ -169,7 +169,6 @@ class Renderer:
             self._draw_live_note(frame, stretch)
         for hand in hands:
             self._draw_hand(frame, hand)
-        self._draw_hud(frame, hud_lines)
 
     def _clear_layers(self, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
         height, width = shape[:2]
@@ -340,7 +339,7 @@ class Renderer:
         height, width = target.shape[:2]
         target[:] = cv2.add(target, upscaled[:height, :width])
 
-    # Hands and HUD
+    # Hands
 
     def _draw_hand(self, frame: np.ndarray, hand: Hand) -> None:
         points = [_int_point(p) for p in hand.points]
@@ -350,13 +349,3 @@ class Renderer:
             cv2.circle(frame, p, 4, JOINT_COLOR, -1, cv2.LINE_AA)
         if hand.pinching:
             cv2.circle(frame, _int_point(hand.pinch_point), 9, PINCH_COLOR, 2, cv2.LINE_AA)
-
-    def _draw_hud(self, frame: np.ndarray, lines: list[str]) -> None:
-        line_height = 22
-        box_width = 12 + max((cv2.getTextSize(line, FONT, 0.5, 1)[0][0] for line in lines), default=0)
-        box_height = 10 + line_height * len(lines)
-        region = frame[8 : 8 + box_height, 8 : 8 + box_width]
-        region[:] = (region * 0.45).astype(np.uint8)
-        for index, line in enumerate(lines):
-            origin = (14, 8 + line_height * (index + 1))
-            cv2.putText(frame, line, origin, FONT, 0.5, TEXT_COLOR, 1, cv2.LINE_AA)

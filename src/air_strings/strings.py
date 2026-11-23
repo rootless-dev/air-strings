@@ -149,6 +149,10 @@ class StringSet:
     def mapping(self) -> PitchMapping:
         return self._mapping
 
+    @property
+    def max_strings(self) -> int:
+        return self._max_strings
+
     def __contains__(self, string: AirString) -> bool:
         return any(s is string for s in self._strings)
 

@@ -25,7 +25,7 @@ def make_string():
 def render(strings, view=EMPTY, now=5.0, particles=None):
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     particles = particles if particles is not None else ParticleSystem(rng=np.random.default_rng(0))
-    Renderer().draw_frame(frame, [], strings, view, particles, now, [])
+    Renderer().draw_frame(frame, [], strings, view, particles, now)
     return frame
 
 

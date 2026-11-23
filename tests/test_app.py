@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from air_strings.app import AirStringsApp
+from air_strings.camera import CameraSession
+from air_strings.engine import Engine
 from air_strings.gestures import PULL_THRESHOLD_VELOCITY, DrawGesture, GestureController, GrabGesture, PullGesture
 from air_strings.hands import INDEX_TIP, THUMB_TIP, Hand
 from air_strings.particles import ParticleSystem
@@ -43,20 +45,32 @@ class LockstepCapture:
         self.reads += 1
         return True, blank_frame()
 
+    def release(self):
+        pass
+
 
 class FreeRunningCapture:
     def read(self):
         return True, blank_frame()
+
+    def release(self):
+        pass
 
 
 class DeadCapture:
     def read(self):
         return False, None
 
+    def release(self):
+        pass
+
 
 class FailingTracker:
     def process(self, frame, now):
         raise ValueError("model crashed")
+
+    def close(self):
+        pass
 
 
 def detection_threads():
@@ -86,6 +100,9 @@ class ScriptedTracker:
         self._previous = {hand_id: tip for hand_id, tip, _ in entries}
         return hands
 
+    def close(self):
+        pass
+
 
 def draw_string_script(left, right):
     """Frames 0-9: both hands pinch and hold a string from `left` to `right`."""
@@ -93,6 +110,8 @@ def draw_string_script(left, right):
 
 
 class RecordingAudio:
+    active_voices = 0
+
     def __init__(self):
         self.plucks = []
 
@@ -106,30 +125,34 @@ class RecordingRenderer(Renderer):
         self.views = []
         self._on_draw = on_draw
 
-    def draw_frame(self, frame, hands, strings, gestures, particles, now, hud_lines):
+    def draw_frame(self, frame, hands, strings, gestures, particles, now):
         self.views.append(gestures)
-        super().draw_frame(frame, hands, strings, gestures, particles, now, hud_lines)
+        super().draw_frame(frame, hands, strings, gestures, particles, now)
         self._on_draw()
 
 
-def build_app(capture, tracker, frames, headless=True, renderer=None, clock=time.monotonic, mailbox=None):
-    worker = DetectionWorker(capture, tracker, mailbox or LatestDetection(), clock=clock)
+def build_app(capture, tracker, frames, renderer=None, clock=time.monotonic, mailbox=None, ui=None):
+    session = CameraSession(
+        0,
+        capture,
+        capture_factory=lambda index: None,
+        tracker_factory=lambda: tracker,
+        worker_factory=lambda c, t: DetectionWorker(c, t, mailbox or LatestDetection(), clock=clock),
+    )
     mapping = PitchMapping()
     strings = StringSet(mapping, SCALES[0])
     audio = RecordingAudio()
     particles = ParticleSystem(rng=np.random.default_rng(0))
     renderer = renderer or RecordingRenderer()
-    app = AirStringsApp(
-        worker=worker,
+    engine = Engine(
         strings=strings,
         gestures=GestureController(strings, DrawGesture(), GrabGesture(), PullGesture()),
         particles=particles,
         renderer=renderer,
         audio=audio,
-        max_frames=frames,
-        headless=headless,
     )
-    return app, worker, strings, audio, particles, renderer
+    app = AirStringsApp(session, engine, max_frames=frames, ui=ui)
+    return app, session.worker, strings, audio, particles, renderer
 
 
 def make_app(script, frames):
@@ -289,32 +312,32 @@ class NoHands:
     def process(self, frame, now):
         return []
 
-
-def fake_window(monkeypatch, key, visible):
-    shown = []
-    monkeypatch.setattr("air_strings.app.cv2.imshow", lambda name, frame: shown.append(frame))
-    monkeypatch.setattr("air_strings.app.cv2.waitKey", lambda delay: key)
-    monkeypatch.setattr("air_strings.app.cv2.getWindowProperty", lambda name, prop: visible)
-    return shown
+    def close(self):
+        pass
 
 
-@pytest.mark.parametrize("key", [ord("q"), 27])
-def test_quit_key_stops_and_joins_the_worker(monkeypatch, key):
-    shown = fake_window(monkeypatch, key, visible=1.0)
-    app, worker, *_ = build_app(FreeRunningCapture(), NoHands(), frames=0, headless=False)
+def test_the_ui_runs_between_starting_and_stopping_the_worker():
+    seen = []
+
+    def ui(engine, session, max_frames):
+        seen.append((session.worker.alive, max_frames))
+
+    app, worker, *_ = build_app(FreeRunningCapture(), NoHands(), frames=7, ui=ui)
 
     assert app.run() == 0
-    assert app.frames_processed == 1 and len(shown) == 1
+    assert seen == [(True, 7)]
     assert not worker.alive
     assert detection_threads() == []
 
 
-def test_closing_the_window_stops_and_joins_the_worker(monkeypatch):
-    fake_window(monkeypatch, -1, visible=0.0)
-    app, worker, *_ = build_app(FreeRunningCapture(), NoHands(), frames=0, headless=False)
+def test_an_error_in_the_ui_still_stops_the_worker():
+    def ui(engine, session, max_frames):
+        raise RuntimeError("window broke")
 
-    assert app.run() == 0
-    assert app.frames_processed == 1
+    app, worker, *_ = build_app(FreeRunningCapture(), NoHands(), frames=0, ui=ui)
+
+    with pytest.raises(RuntimeError, match="window broke"):
+        app.run()
     assert not worker.alive
     assert detection_threads() == []
 
@@ -345,7 +368,7 @@ def test_slow_display_skips_to_the_latest_detection():
             super().__init__()
             self.drawn_at = []
 
-        def draw_frame(self, frame, hands, strings, gestures, particles, now, hud_lines):
+        def draw_frame(self, frame, hands, strings, gestures, particles, now):
             self.drawn_at.append(now)
             time.sleep(0.03)
 
@@ -356,6 +379,9 @@ def test_slow_display_skips_to_the_latest_detection():
         def process(self, frame, now):
             self.calls += 1
             return []
+
+        def close(self):
+            pass
 
     tracker = CountingTracker()
     renderer = SlowRenderer()
