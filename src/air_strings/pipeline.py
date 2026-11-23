@@ -64,6 +64,7 @@ class Detection:
     sequence: int  # 1 for the first detection, then +1 per detection
     # Hands of the detections this one overwrote before they were taken, oldest first.
     skipped: tuple[HandSample, ...] = ()
+    detection_time: float = 0.0  # seconds the tracker took on this frame
 
 
 class LatestDetection:
@@ -71,6 +72,10 @@ class LatestDetection:
 
     The replaced detection's frame is dropped, but its hands are carried over
     in the new detection's `skipped` (up to `max_skipped` of them).
+
+    An optional listener is called, on the publishing thread and outside the
+    lock, after every publish and on close, so a consumer can be woken up
+    without polling.
     """
 
     def __init__(self, max_skipped: int = MAX_SKIPPED) -> None:
@@ -78,6 +83,12 @@ class LatestDetection:
         self._item: Detection | None = None
         self._closed = False
         self._max_skipped = max_skipped
+        self._listener: Callable[[], None] | None = None
+
+    def set_listener(self, listener: Callable[[], None] | None) -> None:
+        """Call `listener()` after each publish and on close; None removes it."""
+        with self._condition:
+            self._listener = listener
 
     def publish(self, item: Detection) -> None:
         with self._condition:
@@ -87,12 +98,18 @@ class LatestDetection:
                 item = dataclasses.replace(item, skipped=skipped[max(0, len(skipped) - self._max_skipped) :])
             self._item = item
             self._condition.notify_all()
+            listener = self._listener
+        if listener is not None:
+            listener()
 
     def close(self) -> None:
         """No more detections will come; wakes up a waiting `take`."""
         with self._condition:
             self._closed = True
             self._condition.notify_all()
+            listener = self._listener
+        if listener is not None:
+            listener()
 
     @property
     def closed(self) -> bool:
@@ -175,8 +192,10 @@ class DetectionWorker:
             failed_reads = 0
             timestamp = self._clock()
             frame = cv2.flip(frame, 1)  # mirror, like a selfie view
+            started = time.perf_counter()
             hands = self._tracker.process(frame, timestamp)
+            detection_time = time.perf_counter() - started
             dt = timestamp - last_timestamp if last_timestamp is not None else 0.0
             last_timestamp = timestamp
             sequence += 1
-            self.mailbox.publish(Detection(frame, hands, timestamp, dt, sequence))
+            self.mailbox.publish(Detection(frame, hands, timestamp, dt, sequence, detection_time=detection_time))

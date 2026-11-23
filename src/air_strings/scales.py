@@ -15,6 +15,11 @@ RANGE_SEMITONES = 24  # two octaves, up to C5
 class Scale:
     name: str
     intervals: tuple[int, ...]
+    short_name: str = ""  # for tight spaces such as a button; defaults to `name`
+
+    @property
+    def label(self) -> str:
+        return self.short_name or self.name
 
     def notes(self, lowest: int = LOWEST_MIDI, span: int = RANGE_SEMITONES) -> list[int]:
         """All MIDI notes of this scale from `lowest` to `lowest + span`, inclusive."""
@@ -27,9 +32,9 @@ class Scale:
 
 
 SCALES = (
-    Scale("C major pentatonic", (0, 2, 4, 7, 9)),
-    Scale("C major", (0, 2, 4, 5, 7, 9, 11)),
-    Scale("chromatic", tuple(range(12))),
+    Scale("C major pentatonic", (0, 2, 4, 7, 9), "Pentatonic"),
+    Scale("C major", (0, 2, 4, 5, 7, 9, 11), "Major"),
+    Scale("chromatic", tuple(range(12)), "Chromatic"),
 )
 
 

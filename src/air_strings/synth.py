@@ -226,6 +226,9 @@ class VoicePool:
         self._mix = np.zeros(max_block, dtype=np.float64)
         self._fade_samples = int(RETRIGGER_FADE_SECONDS * sample_rate)
         self._counter = 0
+        # Voices still sounding after the last rendered block: a plain int, so another
+        # thread can read it without touching the voices the audio thread is rendering.
+        self.sounding_voices = 0
 
     @property
     def active_voices(self) -> int:
@@ -257,6 +260,7 @@ class VoicePool:
         mix[:] = 0.0
         for voice in self._voices:
             voice.render_add(mix, frames)
+        self.sounding_voices = self.active_voices
         mix *= MASTER_GAIN
         np.tanh(mix, out=mix)
         return mix
@@ -312,6 +316,11 @@ class AudioEngine:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+
+    @property
+    def active_voices(self) -> int:
+        """Voices sounding as of the last audio block; safe to read from any thread."""
+        return self._pool.sounding_voices
 
     def pluck(self, string_id: int, frequency: float, velocity: float, position: float) -> None:
         """Called from the video thread; builds the excitation here, off the audio thread."""
